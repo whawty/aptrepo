@@ -101,7 +101,6 @@ CONFIG_DEFAULTS = {
     "label": None,
     "origin": None,
     "description": None,
-    "valid_until": None,        # e.g. "30d", "1w" -- not implemented yet, placeholder
     "allowed_signers": [],      # list of GPG key-ids allowed to sign .changes files
 }
 
