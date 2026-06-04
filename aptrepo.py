@@ -11,10 +11,11 @@ Features:
   - GPG signing via gpg agent
 
 Usage:
-  aptrepo.py add    <dist> <file.deb> [file.deb ...]
-  aptrepo.py remove <dist> <package> <version> [<arch>]
-  aptrepo.py update [<dist>]
-  aptrepo.py list   [<dist>]
+  aptrepo.py add              <dist> [-C <component>] <file.deb> [file.deb ...]
+  aptrepo.py remove           <dist> <package> <version> [<arch>]
+  aptrepo.py ingest           [<incoming_dir>]
+  aptrepo.py update           [<dist>]
+  aptrepo.py list             [<dist>]
   aptrepo.py init
 """
 
@@ -59,6 +60,7 @@ CONFIG_DEFAULTS = {
     "origin": None,
     "description": None,
     "valid_until": None,        # e.g. "30d", "1w" -- not implemented yet, placeholder
+    "allowed_signers": [],      # list of GPG key-ids allowed to sign .changes files
 }
 
 
@@ -87,8 +89,18 @@ def load_config(path: Path) -> dict:
                 cfg[key] = [cfg[key]]
         dists[name] = cfg
 
+    # Normalise allowed_signers in each dist: always a list of strings
+    for dist_cfg in dists.values():
+        signers = dist_cfg.get("allowed_signers") or []
+        if isinstance(signers, str):
+            signers = [signers]
+        dist_cfg["allowed_signers"] = [str(s) for s in signers]
+
+    incoming_dir = repo.get("incoming_dir")
+
     return {
         "base_dir": Path(repo["base_dir"]).expanduser(),
+        "incoming_dir": Path(incoming_dir).expanduser() if incoming_dir else None,
         "dists": dists,
     }
 
@@ -550,6 +562,398 @@ def _entry_sort_key(entry: bytes) -> tuple:
         return ("", "")
 
 
+# ---------------------------------------------------------------------------
+# GPG signature verification
+# ---------------------------------------------------------------------------
+
+def _normalise_keyid(keyid: str) -> str:
+    """Strip leading 0x/0X prefix and uppercase."""
+    return keyid.strip().lstrip("0").replace("x", "", 1).replace("X", "", 1).upper()         if keyid.strip().lower().startswith("0x")         else keyid.strip().upper()
+
+
+def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
+    """Return True if *fingerprint* matches any entry in *allowed_keyids*.
+
+    Fingerprint is a full 40-char hex string (from VALIDSIG).
+    Entries in allowed_keyids may be:
+      - Full fingerprint (40 hex chars)
+      - Long key ID     (16 hex chars)
+      - Short key ID    ( 8 hex chars)  -- accepted but insecure
+    All comparisons are suffix-based so long/short IDs work naturally.
+    Leading "0x" prefixes in configured key IDs are stripped automatically.
+    """
+    fp = fingerprint.strip().upper()
+    for kid in allowed_keyids:
+        kid_norm = _normalise_keyid(kid)
+        if not kid_norm:
+            continue
+        if fp.endswith(kid_norm):
+            return True
+    return False
+
+
+def verify_changes_signature(changes_path: Path,
+                              allowed_keyids: list[str]) -> str:
+    """Verify the GPG signature on a .changes file.
+
+    Returns the full fingerprint of the signing key on success.
+    Raises ValueError with a descriptive message on any failure:
+      - GPG verification fails (bad/missing signature)
+      - Signing key is not in allowed_signers
+      - Short key IDs are configured (warn but still accept if it matches)
+    """
+    result = subprocess.run(
+        ["gpg", "--verify", "--status-fd", "1", str(changes_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    # Parse status output regardless of exit code so we can give good errors
+    fingerprint = None
+    good_sig = False
+    no_pubkey = False
+    err_sig_keyid = None
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        token = parts[1] if parts[0] == "[GNUPG:]" else None
+        if token == "VALIDSIG":
+            fingerprint = parts[2]
+        elif token == "GOODSIG":
+            good_sig = True
+        elif token == "NO_PUBKEY":
+            no_pubkey = True
+            err_sig_keyid = parts[2] if len(parts) > 2 else "unknown"
+        elif token in ("BADSIG", "ERRSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG"):
+            err_sig_keyid = parts[2] if len(parts) > 2 else "unknown"
+
+    if no_pubkey:
+        raise ValueError(
+            f"Signature on {changes_path.name} was made by an unknown key "
+            f"({err_sig_keyid}). Import the signer's public key into the "
+            f"repo host's GPG keyring."
+        )
+
+    if not good_sig or not fingerprint:
+        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "no detail"
+        raise ValueError(
+            f"GPG verification failed for {changes_path.name}: {detail}"
+        )
+
+    # Warn if any configured key IDs are short (8 chars) - insecure
+    for kid in allowed_keyids:
+        kid_norm = _normalise_keyid(kid)
+        if len(kid_norm) == 8:
+            warn(
+                f"Short key ID '{kid}' in allowed_signers is insecure. "
+                f"Use the full fingerprint or at least the 16-char long key ID."
+            )
+
+    if not _fingerprint_matches(fingerprint, allowed_keyids):
+        raise ValueError(
+            f"Signing key {fingerprint} is not in the allowed_signers list "
+            f"for this dist. Configured: {allowed_keyids or ['(none)']}"
+        )
+
+    return fingerprint
+
+
+# ---------------------------------------------------------------------------
+# .changes file parsing
+# ---------------------------------------------------------------------------
+
+def _parse_hash_field(field_value: str) -> dict[str, dict]:
+    """Parse a multi-line Checksums-* or Files field into {filename: {hash/size}}."""
+    result = {}
+    for line in field_value.strip().splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            # Checksums-Sha1/Sha256/Sha512: <hash> <size> <filename>
+            hashval, size, fname = parts
+            result.setdefault(fname, {})["size"] = int(size)
+            result[fname]["hash"] = hashval
+        elif len(parts) == 5:
+            # Files: <md5> <size> <section> <priority> <filename>
+            md5, size, section, _priority, fname = parts
+            result.setdefault(fname, {})["size"] = int(size)
+            result[fname]["md5"] = md5
+            result[fname]["section"] = section
+    return result
+
+
+def parse_changes(changes_path: Path) -> dict:
+    """Parse a (possibly clearsigned) .changes file.
+
+    Returns a dict with keys:
+      distribution, source, version, files
+    Where files is a list of dicts:
+      {filename, size, sha256, sha1, md5, component, section}
+    """
+    # Strip PGP armour if present
+    fd = apt_pkg.open_maybe_clear_signed_file(str(changes_path))
+    raw = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        raw += chunk
+    os.close(fd)
+
+    # Parse via TagFile (handles multi-line fields correctly)
+    with tempfile.NamedTemporaryFile(suffix=".changes", delete=False) as tf:
+        tf.write(raw)
+        tf_name = tf.name
+    try:
+        with open(tf_name) as f:
+            tag_file = apt_pkg.TagFile(f)
+            tag_file.step()
+            section = tag_file.section
+    finally:
+        os.unlink(tf_name)
+
+    distribution = section["Distribution"].strip()
+    source       = section["Source"].strip()
+    version      = section["Version"].strip()
+
+    # Gather hashes from all available checksum fields
+    sha256_map = _parse_hash_field(section.get("Checksums-Sha256", ""))
+    sha1_map   = _parse_hash_field(section.get("Checksums-Sha1", ""))
+    files_map  = _parse_hash_field(section.get("Files", ""))
+
+    # Build unified file list from Files: (it has the section/component info)
+    # Fall back to Checksums-Sha256 keys if Files is absent
+    all_filenames = set(files_map) | set(sha256_map)
+
+    files = []
+    for fname in sorted(all_filenames):
+        if not fname.endswith(".deb"):
+            # Skip .dsc, .tar.*, .buildinfo etc.
+            continue
+        raw_section = files_map.get(fname, {}).get("section", "")
+        if "/" in raw_section:
+            component, sec = raw_section.split("/", 1)
+        else:
+            component = "main"
+            sec = raw_section
+
+        entry = {
+            "filename":  fname,
+            "size":      files_map.get(fname, sha256_map.get(fname, {})).get("size"),
+            "sha256":    sha256_map.get(fname, {}).get("hash"),
+            "sha1":      sha1_map.get(fname, {}).get("hash"),
+            "md5":       files_map.get(fname, {}).get("md5"),
+            "component": component,
+            "section":   sec,
+        }
+        files.append(entry)
+
+    return {
+        "distribution": distribution,
+        "source":       source,
+        "version":      version,
+        "files":        files,
+    }
+
+
+def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
+    """Check all .deb files referenced by a .changes exist and have correct checksums.
+
+    Returns the list of verified .deb Paths.
+    Raises ValueError listing all problems found (checks everything before raising).
+    """
+    errors = []
+    verified = []
+
+    for entry in changes_info["files"]:
+        fname = entry["filename"]
+        deb_path = incoming_dir / fname
+
+        if not deb_path.exists():
+            errors.append(f"  Missing file: {fname}")
+            continue
+
+        actual_size = deb_path.stat().st_size
+        if entry["size"] is not None and actual_size != entry["size"]:
+            errors.append(
+                f"  Size mismatch for {fname}: "
+                f"expected {entry['size']}, got {actual_size}"
+            )
+            continue  # don't bother hashing a wrong-sized file
+
+        # Verify SHA256 if present (preferred), fall back to MD5
+        if entry.get("sha256"):
+            with open(deb_path, "rb") as f:
+                hashes = apt_pkg.Hashes(f)
+            actual_sha256 = next(
+                (h.hashvalue for h in hashes.hashes if h.hashtype == "SHA256"),
+                None,
+            )
+            if actual_sha256 != entry["sha256"]:
+                errors.append(
+                    f"  SHA256 mismatch for {fname}: "
+                    f"expected {entry['sha256']}, got {actual_sha256}"
+                )
+                continue
+        elif entry.get("md5"):
+            with open(deb_path, "rb") as f:
+                actual_md5 = hashlib.md5(f.read()).hexdigest()
+            if actual_md5 != entry["md5"]:
+                errors.append(
+                    f"  MD5 mismatch for {fname}: "
+                    f"expected {entry['md5']}, got {actual_md5}"
+                )
+                continue
+
+        verified.append(deb_path)
+
+    if errors:
+        raise ValueError(
+            f"File verification failed for {changes_info['source']}:\n"
+            + "\n".join(errors)
+        )
+
+    return verified
+
+
+# ---------------------------------------------------------------------------
+# processincoming command
+# ---------------------------------------------------------------------------
+
+def cmd_ingest(cfg: dict, incoming_dir: Path | None):
+    """Process all signed .changes files in the incoming directory."""
+
+    if incoming_dir is None:
+        incoming_dir = cfg.get("incoming_dir")
+    if incoming_dir is None:
+        die(
+            "No incoming directory specified. Pass it as an argument or set "
+            "'incoming_dir' under 'repo:' in the config."
+        )
+    incoming_dir = Path(incoming_dir)
+    if not incoming_dir.exists():
+        die(f"Incoming directory does not exist: {incoming_dir}")
+
+    changes_files = sorted(incoming_dir.glob("*.changes"))
+    if not changes_files:
+        print(f"No .changes files found in {incoming_dir}")
+        return
+
+    print(f"Processing {len(changes_files)} .changes file(s) from {incoming_dir}")
+
+    done_dir    = incoming_dir / "done"
+    failed_dir  = incoming_dir / "failed"
+    done_dir.mkdir(exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+
+    dists_to_update: set[str] = set()
+
+    for changes_path in changes_files:
+        print(f"\n--- {changes_path.name} ---")
+        try:
+            _process_one_changes(cfg, changes_path, incoming_dir, dists_to_update)
+        except Exception as e:
+            print(f"  [FAILED] {e}", file=sys.stderr)
+            # Move the .changes (and its referenced files if we know them) to failed/
+            _move_to(changes_path, failed_dir)
+            continue
+
+    # Regenerate all affected dists once, after processing everything
+    for dist_name in sorted(dists_to_update):
+        update_dist(cfg, dist_name)
+
+
+def _process_one_changes(cfg: dict, changes_path: Path,
+                          incoming_dir: Path, dists_to_update: set[str]):
+    """Process a single .changes file. Raises on any error."""
+
+    # --- 1. Parse the .changes (before signature check so we can give better errors) ---
+    try:
+        changes_info = parse_changes(changes_path)
+    except Exception as e:
+        raise ValueError(f"Could not parse .changes file: {e}") from e
+
+    dist_name = changes_info["distribution"]
+    print(f"  Source:  {changes_info['source']}  {changes_info['version']}")
+    print(f"  Dist:    {dist_name}")
+
+    # --- 2. Check the target dist is known ---
+    if dist_name not in cfg["dists"]:
+        raise ValueError(
+            f"Distribution '{dist_name}' is not configured in this repo. "
+            f"Known dists: {', '.join(cfg['dists'])}"
+        )
+    dist_cfg = cfg["dists"][dist_name]
+
+    # --- 3. Verify GPG signature ---
+    allowed_signers = dist_cfg.get("allowed_signers", [])
+    if not allowed_signers:
+        raise ValueError(
+            f"No allowed_signers configured for dist '{dist_name}'. "
+            f"Add at least one GPG key fingerprint to accept uploads."
+        )
+
+    try:
+        fingerprint = verify_changes_signature(changes_path, allowed_signers)
+    except ValueError:
+        raise  # already descriptive
+    print(f"  Signed by: {fingerprint}")
+
+    # --- 4. Check file list and verify checksums ---
+    if not changes_info["files"]:
+        raise ValueError("No .deb files listed in .changes")
+
+    print(f"  Files ({len(changes_info['files'])}):")
+    for entry in changes_info["files"]:
+        print(f"    {entry['filename']}  [{entry['component']}/{entry['section']}]")
+
+    try:
+        verified_paths = verify_changes_files(changes_info, incoming_dir)
+    except ValueError:
+        raise
+
+    # --- 5. Validate components ---
+    for entry in changes_info["files"]:
+        comp = entry["component"]
+        if comp not in dist_cfg["components"]:
+            raise ValueError(
+                f"Component '{comp}' (from .changes) is not configured for "
+                f"dist '{dist_name}'. Known: {', '.join(dist_cfg['components'])}"
+            )
+
+    # --- 6. Add each .deb to the pool ---
+    base_dir = cfg["base_dir"]
+    for entry, deb_path in zip(changes_info["files"], verified_paths):
+        meta = read_deb(deb_path)
+
+        if meta["arch"] not in dist_cfg["architectures"] and meta["arch"] != "all":
+            warn(
+                f"Architecture '{meta['arch']}' is not listed for dist "
+                f"'{dist_name}'. Adding anyway."
+            )
+
+        add_to_pool(base_dir, dist_name, entry["component"], meta, deb_path)
+
+    dists_to_update.add(dist_name)
+
+    # --- 7. Move processed files to done/ ---
+    _move_to(changes_path, incoming_dir / "done")
+    for deb_path in verified_paths:
+        _move_to(deb_path, incoming_dir / "done")
+    print(f"  [OK] Moved to done/")
+
+
+def _move_to(src: Path, dest_dir: Path):
+    """Move a file to dest_dir, appending a timestamp if name already exists."""
+    dest = dest_dir / src.name
+    if dest.exists():
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = dest_dir / f"{src.stem}.{ts}{src.suffix}"
+    shutil.move(str(src), dest)
+
+
+
 def cmd_update(cfg: dict, dist_name: str | None):
     """Regenerate indices for one or all dists."""
     dists = [dist_name] if dist_name else list(cfg["dists"])
@@ -670,6 +1074,18 @@ def main():
     p_lst.add_argument("dist", nargs="?", default=None,
                        help="Dist to list (default: all)")
 
+    # processincoming
+    p_inc = sub.add_parser(
+        "ingest",
+        help="Ingest signed .changes files from the incoming directory",
+    )
+    p_inc.add_argument(
+        "incoming_dir",
+        nargs="?",
+        default=None,
+        help="Incoming directory (overrides repo.incoming_dir from config)",
+    )
+
     # init
     sub.add_parser("init", help="Initialise directory structure")
 
@@ -688,6 +1104,8 @@ def main():
         cmd_update(cfg, args.dist)
     elif args.command == "list":
         cmd_list(cfg, args.dist)
+    elif args.command == "ingest":
+        cmd_ingest(cfg, args.incoming_dir)
     elif args.command == "init":
         cmd_init(cfg)
 

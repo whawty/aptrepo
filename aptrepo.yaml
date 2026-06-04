@@ -7,6 +7,7 @@
 
 repo:
   base_dir: /srv/apt
+  incoming_dir: /srv/apt/incoming   # default incoming dir for processincoming
 
 # These values are merged into every dist entry.
 # Any key can be overridden per dist.
@@ -19,6 +20,11 @@ defaults:
   sign_with: "0xDEADBEEFCAFEBABE"   # GPG key-id used to sign Release files
   origin: "My Private Repo"
   label:  "My Private Repo"
+  # GPG key fingerprints (or long key IDs) whose .changes signatures are accepted.
+  # Full 40-char fingerprints are recommended; 16-char long IDs are also accepted.
+  # Short 8-char IDs work but are insecure and will produce a warning.
+  allowed_signers:
+    - "0xCAFEBABEDEADBEEF1234ABCD5678EF901234ABCD"  # build server key
 
 dists:
 
@@ -43,6 +49,10 @@ dists:
     architectures:
       - amd64
     sign_with: "0x1234ABCD5678EF90"   # override the default signing key
+    # Override allowed_signers for this dist (e.g. different build server)
+    allowed_signers:
+      - "0xCAFEBABEDEADBEEF1234ABCD5678EF901234ABCD"
+      - "0xABCD1234ABCD1234ABCD1234ABCD1234ABCD1234"
 
   # Unsigned dist (e.g. for local development)
   testing:
