@@ -9,6 +9,7 @@ Features:
   - Multiple dists, components, architectures per repo
   - YAML config with defaults + per-dist overrides
   - GPG signing via gpg agent
+  - Static browsable HTML index with live Packages parsing
 
 Usage:
   aptrepo.py add              <dist> [-C <component>] <file.deb> [file.deb ...]
@@ -23,6 +24,7 @@ Usage:
 import argparse
 import gzip
 import hashlib
+import json
 import lzma
 import os
 import shutil
@@ -47,6 +49,7 @@ REWRITE_ORDER = apt_pkg.REWRITE_PACKAGE_ORDER
 # Fields to strip from the .deb control before writing to the Packages index.
 # We'll add them back ourselves (Filename, Size, hashes).
 _STRIP_FIELDS = {"Filename", "Size", "MD5sum", "SHA1", "SHA256", "SHA512"}
+
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -458,6 +461,7 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
 
     # Regenerate indices for this dist
     update_dist(cfg, dist_name)
+    write_repo_metadata(cfg)
 
 
 def cmd_remove(cfg: dict, dist_name: str,
@@ -502,6 +506,7 @@ def cmd_remove(cfg: dict, dist_name: str,
     else:
         print(f"  Removed {removed} file(s).")
         update_dist(cfg, dist_name)
+        write_repo_metadata(cfg)
 
 
 def update_dist(cfg: dict, dist_name: str):
@@ -863,6 +868,7 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
     # Regenerate all affected dists once, after processing everything
     for dist_name in sorted(dists_to_update):
         update_dist(cfg, dist_name)
+    write_repo_metadata(cfg)
 
 
 def _process_one_changes(cfg: dict, changes_path: Path,
@@ -962,6 +968,7 @@ def cmd_update(cfg: dict, dist_name: str | None):
         if d not in cfg["dists"]:
             die(f"Unknown dist '{d}'.")
         update_dist(cfg, d)
+    write_repo_metadata(cfg)
 
 
 def cmd_list(cfg: dict, dist_name: str | None):
@@ -1124,6 +1131,41 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
         print(f"\nRemoved {total_removed} package file(s).")
         for dist_name in sorted(dists_to_update):
             update_dist(cfg, dist_name)
+        write_repo_metadata(cfg)
+
+
+
+# ---------------------------------------------------------------------------
+# Repo metadata
+# ---------------------------------------------------------------------------
+
+def build_repo_json(cfg: dict) -> dict:
+    """Build the repo.json structure from the loaded config."""
+    dists_out = {}
+    for name, dist_cfg in cfg["dists"].items():
+        dists_out[name] = {
+            "components":    dist_cfg["components"],
+            "architectures": dist_cfg["architectures"],
+            "description":   dist_cfg.get("description") or "",
+        }
+    return {"dists": dists_out}
+
+
+def write_repo_metadata(cfg: dict):
+    """Write repo.json to the repo base directory.
+
+    repo.json describes the dist/component/architecture structure of the repo
+    and is consumed by the static browser index (index.html) served by nginx.
+    """
+    base_dir = cfg["base_dir"]
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_json_path = base_dir / "repo.json"
+    repo_data = build_repo_json(cfg)
+    repo_json_path.write_text(
+        json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n"
+    )
+    print(f"  [meta] Written: repo.json")
 
 
 
@@ -1141,7 +1183,8 @@ def cmd_init(cfg: dict):
                 if not idx.exists():
                     idx.write_bytes(b"")
         print(f"  Created structure for dist '{dist_name}'")
-    print("Done. Run 'update' to regenerate Release files.")
+    write_repo_metadata(cfg)
+    print("Done.")
 
 
 # ---------------------------------------------------------------------------
