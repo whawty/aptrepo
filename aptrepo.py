@@ -56,8 +56,8 @@ _STRIP_FIELDS = {"Filename", "Size", "MD5sum", "SHA1", "SHA256", "SHA512"}
 # up in filesystem paths and index files, so anything outside these patterns is
 # rejected to prevent path traversal and index corruption.
 _PKG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+$")          # package / source name
-_VERSION_RE  = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+~:-]*$")  # epoch:upstream-revision
-_ARCH_RE     = re.compile(r"^[a-z0-9][a-z0-9-]*$")            # amd64, arm64, all, ...
+_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+~:-]*$")  # epoch:upstream-revision
+_ARCH_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")            # amd64, arm64, all, ...
 
 
 def _is_safe_basename(name: str) -> bool:
@@ -90,11 +90,9 @@ def validate_deb_identifiers(package: str, source: str,
         raise ValueError(f"Invalid architecture: {arch!r}")
 
 
-
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
-
 CONFIG_DEFAULTS = {
     "components": ["main"],
     "architectures": ["amd64"],
@@ -193,7 +191,7 @@ def read_deb(deb_path: Path) -> dict:
 
     package = section["Package"]
     version = section["Version"]
-    arch    = section["Architecture"]
+    arch = section["Architecture"]
 
     # Source name (may be "srcname (binversion)", we want just the name).
     # Fall back to the package name if Source is absent or empty.
@@ -529,7 +527,7 @@ def cmd_remove(cfg: dict, dist_name: str,
             deb_path.unlink()
             # clean empty dirs
             for parent in (deb_path.parent, deb_path.parent.parent,
-                            deb_path.parent.parent.parent):
+                           deb_path.parent.parent.parent):
                 try:
                     parent.rmdir()
                 except OSError:
@@ -638,7 +636,7 @@ def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
 
 
 def verify_changes_signature(changes_path: Path,
-                              allowed_keyids: list[str]) -> str:
+                             allowed_keyids: list[str]) -> str:
     """Verify the GPG signature on a .changes file.
 
     Returns the full fingerprint of the signing key on success.
@@ -771,13 +769,13 @@ def parse_changes(changes_path: Path) -> dict:
         os.unlink(tf_name)
 
     distribution = section["Distribution"].strip()
-    source       = section["Source"].strip()
-    version      = section["Version"].strip()
+    source = section["Source"].strip()
+    version = section["Version"].strip()
 
     # Gather hashes from all available checksum fields
     sha256_map = _parse_hash_field(section.get("Checksums-Sha256", ""))
-    sha1_map   = _parse_hash_field(section.get("Checksums-Sha1", ""))
-    files_map  = _parse_hash_field(section.get("Files", ""))
+    sha1_map = _parse_hash_field(section.get("Checksums-Sha1", ""))
+    files_map = _parse_hash_field(section.get("Files", ""))
 
     # Build unified file list from Files: (it has the section/component info)
     # Fall back to Checksums-Sha256 keys if Files is absent
@@ -879,7 +877,7 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# processincoming command
+# ingest command
 # ---------------------------------------------------------------------------
 
 def cmd_ingest(cfg: dict, incoming_dir: Path | None):
@@ -903,8 +901,8 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
 
     print(f"Processing {len(changes_files)} .changes file(s) from {incoming_dir}")
 
-    done_dir    = incoming_dir / "done"
-    failed_dir  = incoming_dir / "failed"
+    done_dir = incoming_dir / "done"
+    failed_dir = incoming_dir / "failed"
     done_dir.mkdir(exist_ok=True)
     failed_dir.mkdir(exist_ok=True)
 
@@ -929,7 +927,7 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
 
 
 def _process_one_changes(cfg: dict, changes_path: Path,
-                          incoming_dir: Path, dists_to_update: set[str]):
+                         incoming_dir: Path, dists_to_update: set[str]):
     """Process a single .changes file. Raises on any error."""
 
     # --- 1. Parse the .changes (before signature check so we can give better errors) ---
@@ -1009,7 +1007,6 @@ def _move_to(src: Path, dest_dir: Path):
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest = dest_dir / f"{src.stem}.{ts}{src.suffix}"
     shutil.move(str(src), dest)
-
 
 
 def cmd_update(cfg: dict, dist_name: str | None):
@@ -1110,9 +1107,9 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
             groups: dict[tuple[str, str], list[tuple[str, Path]]] = {}
 
             for meta in scan_pool(base_dir, dist_name, component):
-                pkg  = meta["package"]
+                pkg = meta["package"]
                 arch = meta["arch"]
-                ver  = meta["version"]
+                ver = meta["version"]
                 if packages is not None and pkg not in packages:
                     continue
                 key = (pkg, arch)
@@ -1133,10 +1130,10 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
                     reverse=True,
                 )
 
-                to_keep   = sorted_versions[:keep]
+                to_keep = sorted_versions[:keep]
                 to_remove = sorted_versions[keep:]
 
-                keep_str   = ", ".join(v for v, _ in to_keep)
+                keep_str = ", ".join(v for v, _ in to_keep)
                 remove_str = ", ".join(v for v, _ in to_remove)
 
                 print(
@@ -1174,7 +1171,6 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
         write_repo_metadata(cfg)
 
 
-
 # ---------------------------------------------------------------------------
 # Repo metadata
 # ---------------------------------------------------------------------------
@@ -1206,7 +1202,6 @@ def write_repo_metadata(cfg: dict):
         json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n"
     )
     print(f"  [meta] Written: repo.json")
-
 
 
 def cmd_init(cfg: dict):
@@ -1252,8 +1247,8 @@ def main():
     )
     parser.add_argument(
         "-c", "--config",
-        default="aptrepo.yaml",
-        help="Path to config file (default: aptrepo.yaml)",
+        default="/etc/whawty/aptrepo.yml",
+        help="Path to config file (default: /etc/whawty/aptrepo.yml)",
     )
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -1287,7 +1282,7 @@ def main():
     p_lst.add_argument("dist", nargs="?", default=None,
                        help="Dist to list (default: all)")
 
-    # processincoming
+    # ingest
     p_inc = sub.add_parser(
         "ingest",
         help="Ingest signed .changes files from the incoming directory",

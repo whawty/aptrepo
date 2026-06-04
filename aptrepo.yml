@@ -6,8 +6,8 @@
 #   dists:     per-distribution config; any key here overrides 'defaults'
 
 repo:
-  base_dir: /srv/apt
-  incoming_dir: /srv/apt/incoming   # default incoming dir for processincoming
+  base_dir: /srv/apt/repo
+  incoming_dir: /srv/apt/incoming   # default incoming dir for ingest command
 
 # These values are merged into every dist entry.
 # Any key can be overridden per dist.
