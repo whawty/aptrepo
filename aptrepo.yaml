@@ -1,0 +1,52 @@
+# aptrepo.yaml - APT repository configuration
+#
+# Structure:
+#   repo:      global repo settings
+#   defaults:  default values applied to every dist (all fields optional)
+#   dists:     per-distribution config; any key here overrides 'defaults'
+
+repo:
+  base_dir: /srv/apt
+
+# These values are merged into every dist entry.
+# Any key can be overridden per dist.
+defaults:
+  components:
+    - main
+  architectures:
+    - amd64
+    - arm64
+  sign_with: "0xDEADBEEFCAFEBABE"   # GPG key-id used to sign Release files
+  origin: "My Private Repo"
+  label:  "My Private Repo"
+
+dists:
+
+  # Minimal dist -- inherits everything from defaults
+  bookworm:
+    description: "Debian 12 (Bookworm) packages"
+
+  # Dist with additional architecture
+  jammy:
+    description: "Ubuntu 22.04 (Jammy) packages"
+    architectures:
+      - amd64
+      - arm64
+      - armhf
+
+  # Dist with multiple components and its own signing key
+  noble:
+    description: "Ubuntu 24.04 (Noble) packages"
+    components:
+      - main
+      - contrib
+    architectures:
+      - amd64
+    sign_with: "0x1234ABCD5678EF90"   # override the default signing key
+
+  # Unsigned dist (e.g. for local development)
+  testing:
+    description: "Internal testing packages"
+    sign_with: ~    # null -- disables signing for this dist
+    architectures:
+      - amd64
