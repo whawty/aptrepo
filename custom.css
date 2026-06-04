@@ -1,0 +1,69 @@
+/*
+ * custom.css — optional overrides for the APT repository browser
+ *
+ * Drop this file next to index.html (or wherever nginx serves it from)
+ * to customise the appearance.  The page works fine without it.
+ *
+ * FONT LOADING
+ * ------------
+ * By default the page uses whatever monospace font the browser has available
+ * (Fira Code, Consolas, Courier New, etc.).  If you want a specific font,
+ * load it here.  Two common approaches are shown below — uncomment the one
+ * that suits your setup.
+ *
+ * Option A: Google Fonts (requires internet access from the browser)
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+:root {
+  --font: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/*
+ * Option B: self-hosted font (no external requests, works on air-gapped hosts)
+ *
+ * Download the woff2 files alongside this stylesheet, then uncomment:
+ *
+ * @font-face {
+ *   font-family: 'JetBrains Mono';
+ *   src: url('fonts/JetBrainsMono-Regular.woff2') format('woff2');
+ *   font-weight: 400;
+ *   font-style: normal;
+ *   font-display: swap;
+ * }
+ * @font-face {
+ *   font-family: 'JetBrains Mono';
+ *   src: url('fonts/JetBrainsMono-Medium.woff2') format('woff2');
+ *   font-weight: 500;
+ *   font-style: normal;
+ *   font-display: swap;
+ * }
+ * @font-face {
+ *   font-family: 'JetBrains Mono';
+ *   src: url('fonts/JetBrainsMono-Bold.woff2') format('woff2');
+ *   font-weight: 700;
+ *   font-style: normal;
+ *   font-display: swap;
+ * }
+ *
+ * :root {
+ *   --font: 'JetBrains Mono', 'Fira Code', monospace;
+ * }
+ */
+
+/*
+ * OTHER OVERRIDES
+ * ---------------
+ * Any CSS variable defined in :root can be overridden here.  For example, to
+ * switch the green accent to blue and use a pure black background, add a
+ * :root block like the following (uncommented):
+ *
+ *     :root {
+ *       --accent: #58a6ff;
+ *       --bg:     #000000;
+ *     }
+ *
+ * Available variables: --bg --bg2 --bg3 --border --text --text-dim
+ *                      --accent --accent-dim --danger --font --radius
+ */

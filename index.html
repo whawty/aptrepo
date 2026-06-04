@@ -4,8 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>APT Repository</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="custom.css" onerror="this.remove()">
 <style>
 /* ---------- reset & base ---------- */
@@ -293,8 +291,16 @@ mark {
 </div>
 
 <script>
+// ─── Repo base URL (directory containing this page) ──────────────────────────
+// Derived from the document location so the page works at any URL prefix,
+// e.g. https://repo.example.com/apt/ or http://apt.example.com/.
+function repoBase() {
+  return new URL('.', document.baseURI).href.replace(/[/]$/, '');
+}
+
 // ─── Packages file parser ─────────────────────────────────────────────────────
 function parsePackages(text) {
+  text = text.replace(/\r\n/g, '\n');   // tolerate CRLF line endings
   return text.split(/\n\n+/).flatMap(stanza => {
     stanza = stanza.trim();
     if (!stanza) return [];
@@ -335,6 +341,56 @@ function highlight(text, term) {
 }
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─── Debian version comparison (matches dpkg --compare-versions) ─────────────
+function debVerCompare(a, b) {
+  a = String(a); b = String(b);
+  const splitEpoch = v => {
+    const i = v.indexOf(':');
+    if (i === -1) return [0, v];
+    return [parseInt(v.slice(0, i), 10) || 0, v.slice(i + 1)];
+  };
+  const splitRev = v => {
+    const i = v.lastIndexOf('-');
+    return i === -1 ? [v, ''] : [v.slice(0, i), v.slice(i + 1)];
+  };
+  const order = c => {
+    if (c === '~') return -1;
+    if (c === undefined || c === '') return 0;
+    if (c >= '0' && c <= '9') return 0;
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return c.charCodeAt(0);
+    return c.charCodeAt(0) + 256;
+  };
+  const isDigit = c => c >= '0' && c <= '9';
+  const cmpPart = (x, y) => {
+    let i = 0, j = 0;
+    while (i < x.length || j < y.length) {
+      let fi = i, fj = j;
+      while (fi < x.length && !isDigit(x[fi])) fi++;
+      while (fj < y.length && !isDigit(y[fj])) fj++;
+      const nx = x.slice(i, fi), ny = y.slice(j, fj);
+      let k = 0;
+      while (k < nx.length || k < ny.length) {
+        const ox = order(nx[k]), oy = order(ny[k]);
+        if (ox !== oy) return ox < oy ? -1 : 1;
+        k++;
+      }
+      i = fi; j = fj;
+      let di = i, dj = j;
+      while (di < x.length && isDigit(x[di])) di++;
+      while (dj < y.length && isDigit(y[dj])) dj++;
+      const dx = parseInt(x.slice(i, di) || '0', 10);
+      const dy = parseInt(y.slice(j, dj) || '0', 10);
+      if (dx !== dy) return dx < dy ? -1 : 1;
+      i = di; j = dj;
+    }
+    return 0;
+  };
+  const [ea, ra] = splitEpoch(a), [eb, rb] = splitEpoch(b);
+  if (ea !== eb) return ea < eb ? -1 : 1;
+  const [ua, rua] = splitRev(ra), [ub, rub] = splitRev(rb);
+  return cmpPart(ua, ub) || cmpPart(rua, rub);
 }
 
 // ─── Multi-select dropdown ────────────────────────────────────────────────────
@@ -432,7 +488,7 @@ document.querySelectorAll('th[data-col]').forEach(th => {
 let allPackages = [];   // all loaded pkg objects
 let repoMeta   = {};   // from repo.json
 let distCtrl, compCtrl;
-let loading = false;
+let loadToken = 0;     // increments per load; stale responses are discarded
 
 function setStatus(msg, count) {
   document.getElementById('status-text').textContent = msg;
@@ -451,13 +507,10 @@ function setStatus(msg, count) {
 
 // ─── Fetch + parse Packages files ────────────────────────────────────────────
 async function loadPackages(selectedDists, selectedComps) {
-  if (loading) return;
-  loading = true;
-  allPackages = [];
+  const myToken = ++loadToken;
   setStatus('Loading…');
 
-  const base = document.querySelector('script[data-base]')?.dataset.base
-    ?? new URL('.', document.baseURI).pathname.replace(/[/]$/, '');
+  const base = repoBase();
 
   const fetches = [];
   for (const dist of selectedDists) {
@@ -483,15 +536,20 @@ async function loadPackages(selectedDists, selectedComps) {
 
   const results = await Promise.all(fetches);
 
-  // Deduplicate: same Package+Version+Arch across arches/components
-  // Keep all distinct (package, version, arch, dist, component) combos
+  // A newer load was started while we awaited: discard these stale results.
+  if (myToken !== loadToken) return;
+
+  // Deduplicate: keep all distinct (package, version, arch, dist, component)
+  // combos.  Architecture:all packages appear in every binary-<arch> index,
+  // so this also collapses those duplicates into a single row.
   const seen = new Set();
+  const merged = [];
   results.flat().forEach(pkg => {
     const key = `${pkg.Package}|${pkg.Version}|${pkg.Architecture}|${pkg._dist}|${pkg._component}`;
-    if (!seen.has(key)) { seen.add(key); allPackages.push(pkg); }
+    if (!seen.has(key)) { seen.add(key); merged.push(pkg); }
   });
+  allPackages = merged;
 
-  loading = false;
   renderTable();
 }
 
@@ -510,15 +568,18 @@ function renderTable() {
     );
   }
 
-  // Sort
-  filtered.sort((a, b) => {
-    let va = a[sortCol] || '';
-    let vb = b[sortCol] || '';
+  // Sort.  Don't mutate allPackages when there's no active filter.
+  filtered = filtered.slice().sort((a, b) => {
     if (sortCol === 'Size') {
-      va = parseInt(va, 10) || 0;
-      vb = parseInt(vb, 10) || 0;
+      const va = parseInt(a.Size, 10) || 0;
+      const vb = parseInt(b.Size, 10) || 0;
       return sortAsc ? va - vb : vb - va;
     }
+    if (sortCol === 'Version') {
+      const r = debVerCompare(a.Version || '', b.Version || '');
+      return sortAsc ? r : -r;
+    }
+    const va = a[sortCol] || '', vb = b[sortCol] || '';
     return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
   });
 
@@ -558,8 +619,7 @@ function renderTable() {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
-  // Derive base path from the script tag or document location
-  const base = new URL('.', document.baseURI).href.replace(/[/]$/, '');
+  const base = repoBase();
 
   let meta;
   try {

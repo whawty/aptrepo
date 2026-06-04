@@ -22,11 +22,13 @@ Usage:
 """
 
 import argparse
+import functools
 import gzip
 import hashlib
 import json
 import lzma
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +51,44 @@ REWRITE_ORDER = apt_pkg.REWRITE_PACKAGE_ORDER
 # Fields to strip from the .deb control before writing to the Packages index.
 # We'll add them back ourselves (Filename, Size, hashes).
 _STRIP_FIELDS = {"Filename", "Size", "MD5sum", "SHA1", "SHA256", "SHA512"}
+
+# Identifier charsets per Debian policy.  Deliberately strict: these values end
+# up in filesystem paths and index files, so anything outside these patterns is
+# rejected to prevent path traversal and index corruption.
+_PKG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+$")          # package / source name
+_VERSION_RE  = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+~:-]*$")  # epoch:upstream-revision
+_ARCH_RE     = re.compile(r"^[a-z0-9][a-z0-9-]*$")            # amd64, arm64, all, ...
+
+
+def _is_safe_basename(name: str) -> bool:
+    """True if *name* is a plain filename (no path separators, no traversal)."""
+    if not name or name in (".", ".."):
+        return False
+    if "/" in name or "\\" in name:
+        return False
+    if name != os.path.basename(name):
+        return False
+    return True
+
+
+def validate_deb_identifiers(package: str, source: str,
+                             version: str, arch: str):
+    """Validate identifiers extracted from a .deb control file.
+
+    These values are used to build filesystem paths and repository index
+    entries, so they must be strictly validated.  Raises ValueError on any
+    value that does not conform to Debian policy character sets (which, among
+    other things, makes path traversal impossible).
+    """
+    if not _PKG_NAME_RE.match(package):
+        raise ValueError(f"Invalid package name: {package!r}")
+    if not _PKG_NAME_RE.match(source):
+        raise ValueError(f"Invalid source name: {source!r}")
+    if not _VERSION_RE.match(version):
+        raise ValueError(f"Invalid version string: {version!r}")
+    if not _ARCH_RE.match(arch):
+        raise ValueError(f"Invalid architecture: {arch!r}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +191,18 @@ def read_deb(deb_path: Path) -> dict:
     ctrl_text = ctrl_bytes.decode("utf-8", errors="replace")
     section = apt_pkg.TagSection(ctrl_text)
 
-    # Source name (may be "srcname (binversion)", we want just the name)
-    raw_src = section.get("Source", section["Package"])
-    source_name = raw_src.split()[0]
+    package = section["Package"]
+    version = section["Version"]
+    arch    = section["Architecture"]
+
+    # Source name (may be "srcname (binversion)", we want just the name).
+    # Fall back to the package name if Source is absent or empty.
+    raw_src = (section.get("Source") or package).split()
+    source_name = raw_src[0] if raw_src else package
+
+    # Reject anything that does not conform to Debian policy.  These values are
+    # used to build filesystem paths, so this also prevents path traversal.
+    validate_deb_identifiers(package, source_name, version, arch)
 
     # Hashes
     with open(deb_path, "rb") as f:
@@ -176,9 +225,9 @@ def read_deb(deb_path: Path) -> dict:
     return {
         "section": section,
         "ctrl_text": ctrl_text,
-        "package": section["Package"],
-        "version": section["Version"],
-        "arch": section["Architecture"],
+        "package": package,
+        "version": version,
+        "arch": arch,
         "source": source_name,
         "size": size,
         "hashes": hash_map,
@@ -265,22 +314,6 @@ def add_to_pool(base_dir: Path, dist: str, component: str,
     shutil.copy2(src_path, dest)
     print(f"  [pool] Added: {dest.relative_to(base_dir)}")
     return dest
-
-
-def remove_from_pool(base_dir: Path, dist: str, component: str,
-                     source_name: str, filename: str) -> bool:
-    """Remove a specific file from the pool. Returns True if removed."""
-    path = pool_path(base_dir, dist, component, source_name, filename)
-    if path.exists():
-        path.unlink()
-        # Clean up empty parent dirs
-        for parent in (path.parent, path.parent.parent, path.parent.parent.parent):
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-        return True
-    return False
 
 
 def scan_pool(base_dir: Path, dist: str, component: str) -> list[dict]:
@@ -447,7 +480,10 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
             continue
 
         print(f"\nAdding {deb_path.name} -> {dist_name}/{component}")
-        meta = read_deb(deb_path)
+        try:
+            meta = read_deb(deb_path)
+        except ValueError as e:
+            die(f"Refusing to add {deb_path.name}: {e}")
         print(f"  Package: {meta['package']}  Version: {meta['version']}  Arch: {meta['arch']}")
         print(f"  Source:  {meta['source']}")
 
@@ -573,8 +609,11 @@ def _entry_sort_key(entry: bytes) -> tuple:
 # ---------------------------------------------------------------------------
 
 def _normalise_keyid(keyid: str) -> str:
-    """Strip leading 0x/0X prefix and uppercase."""
-    return keyid.strip().lstrip("0").replace("x", "", 1).replace("X", "", 1).upper()         if keyid.strip().lower().startswith("0x")         else keyid.strip().upper()
+    """Strip a leading 0x/0X prefix and uppercase the key id."""
+    k = keyid.strip()
+    if k[:2].lower() == "0x":
+        k = k[2:]
+    return k.upper()
 
 
 def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
@@ -614,19 +653,21 @@ def verify_changes_signature(changes_path: Path,
         text=True,
     )
 
-    # Parse status output regardless of exit code so we can give good errors
-    fingerprint = None
+    # Parse the machine-readable status output.  We collect *all* good
+    # signatures so a file carrying several signatures is matched if any of
+    # them belongs to an allowed key.
+    valid_fingerprints = []
     good_sig = False
     no_pubkey = False
     err_sig_keyid = None
 
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 2 or parts[0] != "[GNUPG:]":
             continue
-        token = parts[1] if parts[0] == "[GNUPG:]" else None
-        if token == "VALIDSIG":
-            fingerprint = parts[2]
+        token = parts[1]
+        if token == "VALIDSIG" and len(parts) > 2:
+            valid_fingerprints.append(parts[2])
         elif token == "GOODSIG":
             good_sig = True
         elif token == "NO_PUBKEY":
@@ -642,8 +683,12 @@ def verify_changes_signature(changes_path: Path,
             f"repo host's GPG keyring."
         )
 
-    if not good_sig or not fingerprint:
-        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "no detail"
+    # gpg returns non-zero if *any* signature is bad, expired or revoked.
+    # Requiring a zero exit code (in addition to a good signature) means a
+    # file cannot be accepted by smuggling one good signature alongside a
+    # broken one.
+    if result.returncode != 0 or not good_sig or not valid_fingerprints:
+        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "no valid signature"
         raise ValueError(
             f"GPG verification failed for {changes_path.name}: {detail}"
         )
@@ -657,13 +702,19 @@ def verify_changes_signature(changes_path: Path,
                 f"Use the full fingerprint or at least the 16-char long key ID."
             )
 
-    if not _fingerprint_matches(fingerprint, allowed_keyids):
+    matched = next(
+        (fp for fp in valid_fingerprints
+         if _fingerprint_matches(fp, allowed_keyids)),
+        None,
+    )
+    if matched is None:
         raise ValueError(
-            f"Signing key {fingerprint} is not in the allowed_signers list "
-            f"for this dist. Configured: {allowed_keyids or ['(none)']}"
+            f"Signing key(s) {', '.join(valid_fingerprints)} not in the "
+            f"allowed_signers list for this dist. "
+            f"Configured: {allowed_keyids or ['(none)']}"
         )
 
-    return fingerprint
+    return matched
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +788,10 @@ def parse_changes(changes_path: Path) -> dict:
         if not fname.endswith(".deb"):
             # Skip .dsc, .tar.*, .buildinfo etc.
             continue
+        # Defence in depth: filenames from the .changes are used to locate
+        # files on disk, so reject anything that is not a plain basename.
+        if not _is_safe_basename(fname):
+            raise ValueError(f"Unsafe filename in .changes: {fname!r}")
         raw_section = files_map.get(fname, {}).get("section", "")
         if "/" in raw_section:
             component, sec = raw_section.split("/", 1)
@@ -861,7 +916,9 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
             _process_one_changes(cfg, changes_path, incoming_dir, dists_to_update)
         except Exception as e:
             print(f"  [FAILED] {e}", file=sys.stderr)
-            # Move the .changes (and its referenced files if we know them) to failed/
+            # Move the .changes to failed/.  Referenced .deb files are left in
+            # place: a parse/verify failure means we cannot reliably attribute
+            # them, and they may be shared with another .changes.
             _move_to(changes_path, failed_dir)
             continue
 
@@ -901,10 +958,7 @@ def _process_one_changes(cfg: dict, changes_path: Path,
             f"Add at least one GPG key fingerprint to accept uploads."
         )
 
-    try:
-        fingerprint = verify_changes_signature(changes_path, allowed_signers)
-    except ValueError:
-        raise  # already descriptive
+    fingerprint = verify_changes_signature(changes_path, allowed_signers)
     print(f"  Signed by: {fingerprint}")
 
     # --- 4. Check file list and verify checksums ---
@@ -915,10 +969,7 @@ def _process_one_changes(cfg: dict, changes_path: Path,
     for entry in changes_info["files"]:
         print(f"    {entry['filename']}  [{entry['component']}/{entry['section']}]")
 
-    try:
-        verified_paths = verify_changes_files(changes_info, incoming_dir)
-    except ValueError:
-        raise
+    verified_paths = verify_changes_files(changes_info, incoming_dir)
 
     # --- 5. Validate components ---
     for entry in changes_info["files"]:
@@ -1071,27 +1122,16 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
                 if len(versions) <= keep:
                     continue  # nothing to prune here
 
-                # Sort newest-first using Debian version ordering
-                versions.sort(
-                    key=lambda x: x[0],
+                # Sort newest-first using proper Debian version ordering.
+                # apt_pkg.version_compare understands epochs, tildes, etc.,
+                # which a plain string sort would get wrong.
+                sorted_versions = sorted(
+                    versions,
+                    key=functools.cmp_to_key(
+                        lambda a, b: apt_pkg.version_compare(a[0], b[0])
+                    ),
                     reverse=True,
                 )
-                # Use apt_pkg.version_compare for a proper sort
-                # (Python's default string sort would mis-order epoch versions)
-                def _vkey(item):
-                    return item[0]
-
-                # Insertion-sort by version_compare to get correct Debian order
-                sorted_versions = [versions[0]]
-                for item in versions[1:]:
-                    inserted = False
-                    for i, existing in enumerate(sorted_versions):
-                        if apt_pkg.version_compare(item[0], existing[0]) > 0:
-                            sorted_versions.insert(i, item)
-                            inserted = True
-                            break
-                    if not inserted:
-                        sorted_versions.append(item)
 
                 to_keep   = sorted_versions[:keep]
                 to_remove = sorted_versions[keep:]
