@@ -1217,6 +1217,25 @@ def cmd_init(cfg: dict):
                 if not idx.exists():
                     idx.write_bytes(b"")
         print(f"  Created structure for dist '{dist_name}'")
+
+        # If suite differs from the dist name, create a symlink so clients
+        # using either name can find the dist.
+        # e.g. dist 'bookworm' with suite 'stable' -> dists/stable -> bookworm
+        suite = dist_cfg.get("suite")
+        if suite and suite != dist_name:
+            suite_link = dists_path(base_dir, suite)
+            if suite_link.exists() or suite_link.is_symlink():
+                if suite_link.is_symlink() and suite_link.resolve() == dists_path(base_dir, dist_name).resolve():
+                    print(f"  Suite symlink already exists: dists/{suite} -> {dist_name}")
+                else:
+                    warn(
+                        f"Cannot create suite symlink dists/{suite} -> {dist_name}: "
+                        f"path already exists and points elsewhere."
+                    )
+            else:
+                suite_link.symlink_to(dist_name)
+                print(f"  Created suite symlink: dists/{suite} -> {dist_name}")
+
     write_repo_metadata(cfg)
     print("Done.")
 
