@@ -14,6 +14,7 @@ Usage:
   aptrepo.py add              <dist> [-C <component>] <file.deb> [file.deb ...]
   aptrepo.py remove           <dist> <package> <version> [<arch>]
   aptrepo.py ingest           [<incoming_dir>]
+  aptrepo.py prune            <n> [options]
   aptrepo.py update           [<dist>]
   aptrepo.py list             [<dist>]
   aptrepo.py init
@@ -997,6 +998,135 @@ def cmd_list(cfg: dict, dist_name: str | None):
             ))
 
 
+def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
+              components: list[str] | None, packages: list[str] | None,
+              dry_run: bool):
+    """Remove old package versions from the pool, keeping the <keep> newest.
+
+    Versions are sorted using apt_pkg.version_compare so Debian version
+    ordering is respected (e.g. 1.0-2 > 1.0-1, 2:1.0 > 1.0).
+
+    Pruning scope:
+      - dists:      limit to these dist names      (default: all configured)
+      - components: limit to these component names (default: all in each dist)
+      - packages:   limit to these package names   (default: all packages)
+
+    Within each (dist, component, package, arch) group the newest <keep>
+    versions are retained; older ones are deleted.  After pruning the affected
+    dists are regenerated (skipped in dry-run mode).
+    """
+    if keep < 1:
+        die("--keep must be at least 1.")
+
+    base_dir = cfg["base_dir"]
+
+    # Resolve dist list
+    target_dists = []
+    for d in (dists or list(cfg["dists"])):
+        if d not in cfg["dists"]:
+            die(f"Unknown dist '{d}'.")
+        target_dists.append(d)
+
+    mode = "[DRY RUN] " if dry_run else ""
+    print(f"{mode}Pruning: keep {keep} version(s) per package per arch")
+    if dists:
+        print(f"  Dists:      {', '.join(dists)}")
+    if components:
+        print(f"  Components: {', '.join(components)}")
+    if packages:
+        print(f"  Packages:   {', '.join(packages)}")
+
+    total_removed = 0
+    dists_to_update: set[str] = set()
+
+    for dist_name in target_dists:
+        dist_cfg = cfg["dists"][dist_name]
+        target_components = [
+            c for c in dist_cfg["components"]
+            if components is None or c in components
+        ]
+
+        for component in target_components:
+            # Gather all entries for this dist+component, grouped by
+            # (package_name, arch) -> list of (version, pool_path)
+            groups: dict[tuple[str, str], list[tuple[str, Path]]] = {}
+
+            for meta in scan_pool(base_dir, dist_name, component):
+                pkg  = meta["package"]
+                arch = meta["arch"]
+                ver  = meta["version"]
+                if packages is not None and pkg not in packages:
+                    continue
+                key = (pkg, arch)
+                groups.setdefault(key, []).append((ver, meta["pool_path"]))
+
+            for (pkg, arch), versions in sorted(groups.items()):
+                if len(versions) <= keep:
+                    continue  # nothing to prune here
+
+                # Sort newest-first using Debian version ordering
+                versions.sort(
+                    key=lambda x: x[0],
+                    reverse=True,
+                )
+                # Use apt_pkg.version_compare for a proper sort
+                # (Python's default string sort would mis-order epoch versions)
+                def _vkey(item):
+                    return item[0]
+
+                # Insertion-sort by version_compare to get correct Debian order
+                sorted_versions = [versions[0]]
+                for item in versions[1:]:
+                    inserted = False
+                    for i, existing in enumerate(sorted_versions):
+                        if apt_pkg.version_compare(item[0], existing[0]) > 0:
+                            sorted_versions.insert(i, item)
+                            inserted = True
+                            break
+                    if not inserted:
+                        sorted_versions.append(item)
+
+                to_keep   = sorted_versions[:keep]
+                to_remove = sorted_versions[keep:]
+
+                keep_str   = ", ".join(v for v, _ in to_keep)
+                remove_str = ", ".join(v for v, _ in to_remove)
+
+                print(
+                    f"  {dist_name}/{component}  {pkg} [{arch}]:\n"
+                    f"    keep:   {keep_str}\n"
+                    f"    remove: {remove_str}"
+                )
+
+                if not dry_run:
+                    for _ver, pool_path in to_remove:
+                        pool_path.unlink()
+                        # Clean up empty parent dirs
+                        for parent in (pool_path.parent,
+                                       pool_path.parent.parent,
+                                       pool_path.parent.parent.parent):
+                            try:
+                                parent.rmdir()
+                            except OSError:
+                                break
+                    dists_to_update.add(dist_name)
+
+                total_removed += len(to_remove)
+
+    if total_removed == 0:
+        print("  Nothing to prune.")
+        return
+
+    if dry_run:
+        print(f"\n[DRY RUN] Would remove {total_removed} package file(s). "
+              f"Re-run without --dry-run to apply.")
+    else:
+        print(f"\nRemoved {total_removed} package file(s).")
+        for dist_name in sorted(dists_to_update):
+            update_dist(cfg, dist_name)
+
+
+
 def cmd_init(cfg: dict):
     """Create the directory structure for all configured dists."""
     base_dir = cfg["base_dir"]
@@ -1086,6 +1216,32 @@ def main():
         help="Incoming directory (overrides repo.incoming_dir from config)",
     )
 
+    # prune
+    p_prn = sub.add_parser(
+        "prune",
+        help="Remove old package versions, keeping the N newest per package",
+    )
+    p_prn.add_argument(
+        "keep", type=int, metavar="N",
+        help="Number of versions to keep per package per arch",
+    )
+    p_prn.add_argument(
+        "-d", "--dist", dest="dists", action="append", metavar="DIST",
+        help="Limit to this dist (repeatable; default: all dists)",
+    )
+    p_prn.add_argument(
+        "-C", "--component", dest="components", action="append", metavar="COMPONENT",
+        help="Limit to this component (repeatable; default: all components)",
+    )
+    p_prn.add_argument(
+        "-p", "--package", dest="packages", action="append", metavar="PACKAGE",
+        help="Limit to this package name (repeatable; default: all packages)",
+    )
+    p_prn.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="Print what would be removed without actually removing anything",
+    )
+
     # init
     sub.add_parser("init", help="Initialise directory structure")
 
@@ -1106,6 +1262,9 @@ def main():
         cmd_list(cfg, args.dist)
     elif args.command == "ingest":
         cmd_ingest(cfg, args.incoming_dir)
+    elif args.command == "prune":
+        cmd_prune(cfg, args.keep, args.dists, args.components,
+                  args.packages, args.dry_run)
     elif args.command == "init":
         cmd_init(cfg)
 
