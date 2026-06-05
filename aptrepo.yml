@@ -8,6 +8,12 @@
 repo:
   base_dir: /srv/apt/repo
   incoming_dir: /srv/apt/incoming   # default incoming dir for ingest command
+  # Public keys (certs) allowed to sign uploaded .changes files. May be a
+  # single file (one or many certs) or a directory of cert files. Used by the
+  # 'ingest' command, which verifies signatures with Sequoia-PGP (pysequoia).
+  # Export build-server public keys here, e.g.:
+  #   gpg --armor --export <key-id> > /etc/whawty/signers/buildserver.asc
+  signer_keyring: /etc/whawty/signers
 
 # These values are merged into every dist entry.
 # Any key can be overridden per dist.

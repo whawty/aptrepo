@@ -138,10 +138,12 @@ def load_config(path: Path) -> dict:
         dist_cfg["allowed_signers"] = [str(s) for s in signers]
 
     incoming_dir = repo.get("incoming_dir")
+    signer_keyring = repo.get("signer_keyring")
 
     return {
         "base_dir": Path(repo["base_dir"]).expanduser(),
         "incoming_dir": Path(incoming_dir).expanduser() if incoming_dir else None,
+        "signer_keyring": Path(signer_keyring).expanduser() if signer_keyring else None,
         "dists": dists,
     }
 
@@ -602,8 +604,109 @@ def _entry_sort_key(entry: bytes) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# GPG signature verification
+# Signature verification (Sequoia-PGP via the pysequoia bindings)
 # ---------------------------------------------------------------------------
+
+def _import_pysequoia():
+    """Import pysequoia lazily so commands that don't verify signatures
+    (add, remove, prune, list, update, init) work without the dependency.
+
+    Returns the (Cert, verify) pair. Raises a clear error if unavailable.
+    """
+    try:
+        from pysequoia import Cert, verify
+    except ImportError as e:
+        die(
+            "The 'ingest' command requires the pysequoia library for signature "
+            "verification, but it could not be imported.\n"
+            "Install it with:  apt install python3-pysequoia   (Debian trixie+, "
+            "Ubuntu 26.04+)\n"
+            f"Import error: {e}"
+        )
+    return Cert, verify
+
+
+def load_signer_certs(keyring: Path) -> list:
+    """Load all OpenPGP certificates (public keys) from the signer keyring.
+
+    *keyring* may be a single file (possibly containing several certs) or a
+    directory of cert files.  Returns a list of pysequoia Cert objects.
+    """
+    Cert, _ = _import_pysequoia()
+
+    if not keyring.exists():
+        die(f"signer_keyring path does not exist: {keyring}")
+
+    files = []
+    if keyring.is_dir():
+        files = [p for p in sorted(keyring.iterdir()) if p.is_file()]
+    else:
+        files = [keyring]
+
+    certs = []
+    for path in files:
+        try:
+            certs.extend(Cert.split_file(str(path)))
+        except Exception as e:
+            warn(f"Could not load certificates from {path}: {e}")
+
+    if not certs:
+        die(
+            f"No certificates found in signer_keyring: {keyring}\n"
+            f"Export your build servers' public keys there, e.g.:\n"
+            f"  gpg --armor --export <key-id> > {keyring}/buildserver.asc"
+        )
+    return certs
+
+
+def verify_changes_signature(changes_path: Path, certs: list) -> tuple[list[str], bytes]:
+    """Cryptographically verify the signature on a (clearsigned) .changes file.
+
+    Verification is delegated entirely to Sequoia-PGP: it succeeds only if the
+    file carries at least one valid signature made by one of the supplied
+    *certs*.  Tampered, unsigned, truncated, or unknown-key inputs all cause
+    Sequoia to raise, which we translate into a ValueError.
+
+    Returns a tuple of:
+      - the list of certificate (primary key) fingerprints that produced a
+        valid signature, uppercased
+      - the verified payload bytes (the clear-text content of the .changes)
+
+    Note: authorisation (is this signer allowed for this dist?) is NOT decided
+    here -- the caller checks the returned fingerprints against the dist's
+    allowed_signers after parsing the verified payload.
+    """
+    _, verify = _import_pysequoia()
+
+    raw = changes_path.read_bytes()
+
+    # The store callback is handed the key IDs referenced by the signature(s);
+    # we simply offer every known cert and let Sequoia pick. Returning more
+    # certs than necessary is explicitly allowed.
+    def store(_key_ids):
+        return certs
+
+    try:
+        result = verify(bytes=raw, store=store)
+    except Exception as e:
+        # Sequoia raises on bad/missing/unknown/truncated signatures. Collapse
+        # its (verbose, backtrace-laden) error into a single concise line.
+        detail = str(e).splitlines()[0] if str(e) else e.__class__.__name__
+        raise ValueError(
+            f"Signature verification failed for {changes_path.name}: {detail}"
+        ) from e
+
+    valid_fingerprints = [s.certificate.upper() for s in result.valid_sigs]
+    if not valid_fingerprints:
+        # Defensive: current pysequoia raises rather than returning an empty
+        # list, but never trust an unsigned/empty result.
+        raise ValueError(
+            f"Signature verification failed for {changes_path.name}: "
+            f"no valid signatures."
+        )
+
+    return valid_fingerprints, result.bytes
+
 
 def _normalise_keyid(keyid: str) -> str:
     """Strip a leading 0x/0X prefix and uppercase the key id."""
@@ -634,86 +737,6 @@ def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
     return False
 
 
-def verify_changes_signature(changes_path: Path,
-                             allowed_keyids: list[str]) -> str:
-    """Verify the GPG signature on a .changes file.
-
-    Returns the full fingerprint of the signing key on success.
-    Raises ValueError with a descriptive message on any failure:
-      - GPG verification fails (bad/missing signature)
-      - Signing key is not in allowed_signers
-      - Short key IDs are configured (warn but still accept if it matches)
-    """
-    result = subprocess.run(
-        ["gpg", "--verify", "--status-fd", "1", str(changes_path)],
-        capture_output=True,
-        text=True,
-    )
-
-    # Parse the machine-readable status output.  We collect *all* good
-    # signatures so a file carrying several signatures is matched if any of
-    # them belongs to an allowed key.
-    valid_fingerprints = []
-    good_sig = False
-    no_pubkey = False
-    err_sig_keyid = None
-
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or parts[0] != "[GNUPG:]":
-            continue
-        token = parts[1]
-        if token == "VALIDSIG" and len(parts) > 2:
-            valid_fingerprints.append(parts[2])
-        elif token == "GOODSIG":
-            good_sig = True
-        elif token == "NO_PUBKEY":
-            no_pubkey = True
-            err_sig_keyid = parts[2] if len(parts) > 2 else "unknown"
-        elif token in ("BADSIG", "ERRSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG"):
-            err_sig_keyid = parts[2] if len(parts) > 2 else "unknown"
-
-    if no_pubkey:
-        raise ValueError(
-            f"Signature on {changes_path.name} was made by an unknown key "
-            f"({err_sig_keyid}). Import the signer's public key into the "
-            f"repo host's GPG keyring."
-        )
-
-    # gpg returns non-zero if *any* signature is bad, expired or revoked.
-    # Requiring a zero exit code (in addition to a good signature) means a
-    # file cannot be accepted by smuggling one good signature alongside a
-    # broken one.
-    if result.returncode != 0 or not good_sig or not valid_fingerprints:
-        detail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "no valid signature"
-        raise ValueError(
-            f"GPG verification failed for {changes_path.name}: {detail}"
-        )
-
-    # Warn if any configured key IDs are short (8 chars) - insecure
-    for kid in allowed_keyids:
-        kid_norm = _normalise_keyid(kid)
-        if len(kid_norm) == 8:
-            warn(
-                f"Short key ID '{kid}' in allowed_signers is insecure. "
-                f"Use the full fingerprint or at least the 16-char long key ID."
-            )
-
-    matched = next(
-        (fp for fp in valid_fingerprints
-         if _fingerprint_matches(fp, allowed_keyids)),
-        None,
-    )
-    if matched is None:
-        raise ValueError(
-            f"Signing key(s) {', '.join(valid_fingerprints)} not in the "
-            f"allowed_signers list for this dist. "
-            f"Configured: {allowed_keyids or ['(none)']}"
-        )
-
-    return matched
-
-
 # ---------------------------------------------------------------------------
 # .changes file parsing
 # ---------------------------------------------------------------------------
@@ -737,27 +760,21 @@ def _parse_hash_field(field_value: str) -> dict[str, dict]:
     return result
 
 
-def parse_changes(changes_path: Path) -> dict:
-    """Parse a (possibly clearsigned) .changes file.
+def parse_changes(payload: bytes) -> dict:
+    """Parse the verified payload of a .changes file.
+
+    *payload* must be the clear-text content that Sequoia returned from
+    signature verification -- NOT the raw clearsigned file.  Parsing only
+    verified bytes guarantees we never act on data that wasn't signed.
 
     Returns a dict with keys:
       distribution, source, version, files
     Where files is a list of dicts:
       {filename, size, sha256, sha1, md5, component, section}
     """
-    # Strip PGP armour if present
-    fd = apt_pkg.open_maybe_clear_signed_file(str(changes_path))
-    raw = b""
-    while True:
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            break
-        raw += chunk
-    os.close(fd)
-
     # Parse via TagFile (handles multi-line fields correctly)
     with tempfile.NamedTemporaryFile(suffix=".changes", delete=False) as tf:
-        tf.write(raw)
+        tf.write(payload)
         tf_name = tf.name
     try:
         with open(tf_name) as f:
@@ -893,6 +910,17 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
     if not incoming_dir.exists():
         die(f"Incoming directory does not exist: {incoming_dir}")
 
+    # Signature verification needs the build servers' public certs.
+    keyring = cfg.get("signer_keyring")
+    if keyring is None:
+        die(
+            "No signer_keyring configured. Set 'signer_keyring' under 'repo:' "
+            "in the config to a file or directory containing the public keys "
+            "allowed to sign uploads."
+        )
+    certs = load_signer_certs(keyring)
+    print(f"Loaded {len(certs)} signer certificate(s) from {keyring}")
+
     changes_files = sorted(incoming_dir.glob("*.changes"))
     if not changes_files:
         print(f"No .changes files found in {incoming_dir}")
@@ -910,7 +938,7 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
     for changes_path in changes_files:
         print(f"\n--- {changes_path.name} ---")
         try:
-            _process_one_changes(cfg, changes_path, incoming_dir, dists_to_update)
+            _process_one_changes(cfg, changes_path, incoming_dir, certs, dists_to_update)
         except Exception as e:
             print(f"  [FAILED] {e}", file=sys.stderr)
             # Move the .changes to failed/.  Referenced .deb files are left in
@@ -925,13 +953,20 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
     write_repo_metadata(cfg)
 
 
-def _process_one_changes(cfg: dict, changes_path: Path,
-                         incoming_dir: Path, dists_to_update: set[str]):
+def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
+                         certs: list, dists_to_update: set[str]):
     """Process a single .changes file. Raises on any error."""
 
-    # --- 1. Parse the .changes (before signature check so we can give better errors) ---
+    # --- 1. Verify the signature FIRST, against the whole keyring. ---
+    # We deliberately verify before parsing so that everything we parse later
+    # comes from cryptographically verified bytes, never from the raw file.
+    valid_fingerprints, payload = verify_changes_signature(changes_path, certs)
+
+    # --- 2. Parse the *verified* payload. ---
     try:
-        changes_info = parse_changes(changes_path)
+        changes_info = parse_changes(payload)
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"Could not parse .changes file: {e}") from e
 
@@ -939,7 +974,7 @@ def _process_one_changes(cfg: dict, changes_path: Path,
     print(f"  Source:  {changes_info['source']}  {changes_info['version']}")
     print(f"  Dist:    {dist_name}")
 
-    # --- 2. Check the target dist is known ---
+    # --- 3. Check the target dist is known. ---
     if dist_name not in cfg["dists"]:
         raise ValueError(
             f"Distribution '{dist_name}' is not configured in this repo. "
@@ -947,18 +982,36 @@ def _process_one_changes(cfg: dict, changes_path: Path,
         )
     dist_cfg = cfg["dists"][dist_name]
 
-    # --- 3. Verify GPG signature ---
+    # --- 4. Authorisation: the signer must be allowed for THIS dist. ---
+    # The signature is already known to be cryptographically valid; here we
+    # enforce the per-dist allow-list.
     allowed_signers = dist_cfg.get("allowed_signers", [])
     if not allowed_signers:
         raise ValueError(
             f"No allowed_signers configured for dist '{dist_name}'. "
-            f"Add at least one GPG key fingerprint to accept uploads."
+            f"Add at least one key fingerprint to accept uploads."
         )
+    for kid in allowed_signers:
+        if len(_normalise_keyid(kid)) == 8:
+            warn(
+                f"Short key ID '{kid}' in allowed_signers is insecure. "
+                f"Use the full 40-char fingerprint."
+            )
 
-    fingerprint = verify_changes_signature(changes_path, allowed_signers)
-    print(f"  Signed by: {fingerprint}")
+    matched = next(
+        (fp for fp in valid_fingerprints
+         if _fingerprint_matches(fp, allowed_signers)),
+        None,
+    )
+    if matched is None:
+        raise ValueError(
+            f"Valid signature(s) from {', '.join(valid_fingerprints)} but none "
+            f"are in the allowed_signers list for dist '{dist_name}'. "
+            f"Configured: {allowed_signers}"
+        )
+    print(f"  Signed by: {matched}")
 
-    # --- 4. Check file list and verify checksums ---
+    # --- 5. Check file list and verify checksums ---
     if not changes_info["files"]:
         raise ValueError("No .deb files listed in .changes")
 
