@@ -130,12 +130,31 @@ def load_config(path: Path) -> dict:
                 cfg[key] = [cfg[key]]
         dists[name] = cfg
 
-    # Normalise allowed_signers in each dist: always a list of strings
-    for dist_cfg in dists.values():
+    for name, dist_cfg in dists.items():
+        # Normalise allowed_signers: always a list of strings.
         signers = dist_cfg.get("allowed_signers") or []
         if isinstance(signers, str):
             signers = [signers]
         dist_cfg["allowed_signers"] = [str(s) for s in signers]
+
+        # sign_with is passed verbatim to gpg as a key id, so it MUST be a
+        # string.  YAML silently parses unquoted values like 0xDEADBEEF (hex)
+        # or all-digit key ids as integers, and str() of those would not round
+        # trip to the intended key id -- so refuse rather than guess.
+        sign_with = dist_cfg.get("sign_with")
+        if sign_with is not None and not isinstance(sign_with, str):
+            die(
+                f"Config error: 'sign_with' for dist '{name}' must be a quoted "
+                f"string, but YAML parsed it as {type(sign_with).__name__} "
+                f"({sign_with!r}). Quote the key id in the config, e.g.:\n"
+                f"    sign_with: \"0xDEADBEEFCAFEBABE\""
+            )
+
+        # Free-text fields: coerce to str so number-like values (e.g. a suite
+        # named '12') don't break path building or Release generation.
+        for key in ("suite", "origin", "label", "description"):
+            if dist_cfg.get(key) is not None:
+                dist_cfg[key] = str(dist_cfg[key])
 
     incoming_dir = repo.get("incoming_dir")
     signer_keyring = repo.get("signer_keyring")
