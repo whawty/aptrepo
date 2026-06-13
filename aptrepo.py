@@ -328,6 +328,22 @@ def scan_pool(base_dir: Path, dist: str, component: str) -> list[dict]:
     return entries
 
 
+def remove_pool_file(pool_path: Path):
+    """Remove a single .deb from the pool and tidy up emptied directories.
+
+    Walks up the pool/<dist>/<component>/<prefix>/<source>/ layout removing the
+    source, prefix, and component directories if (and only if) they are empty.
+    """
+    pool_path.unlink()
+    for parent in (pool_path.parent,
+                   pool_path.parent.parent,
+                   pool_path.parent.parent.parent):
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
 # ---------------------------------------------
 # Release file generation
 
@@ -1041,14 +1057,7 @@ def cmd_remove(cfg: dict, dist_name: str,
             if arch and meta["arch"] != arch:
                 continue
             print(f"  [remove] {deb_path.relative_to(base_dir)}")
-            deb_path.unlink()
-            # clean empty dirs
-            for parent in (deb_path.parent, deb_path.parent.parent,
-                           deb_path.parent.parent.parent):
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
+            remove_pool_file(deb_path)
             removed += 1
 
     if removed == 0:
@@ -1291,6 +1300,55 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
 # command: prune
 # ---------------------------------------------------------------------------
 
+def _resolve_prune_dists(cfg: dict, dists: list[str] | None) -> list[str]:
+    """Validate requested dist names and return the list to prune.
+
+    Defaults to all configured dists.  Dies on an unknown dist name.
+    """
+    target_dists = []
+    for d in (dists or list(cfg["dists"])):
+        if d not in cfg["dists"]:
+            die(f"Unknown dist '{d}'.")
+        target_dists.append(d)
+    return target_dists
+
+
+def _group_pool_versions(base_dir: Path, dist_name: str, component: str,
+                         packages: list[str] | None
+                         ) -> dict[tuple[str, str], list[tuple[str, Path]]]:
+    """Group a dist+component's pool into {(package, arch): [(version, path)]}.
+
+    If *packages* is given, only those package names are included.
+    """
+    groups: dict[tuple[str, str], list[tuple[str, Path]]] = {}
+    for meta in scan_pool(base_dir, dist_name, component):
+        pkg = meta["package"]
+        if packages is not None and pkg not in packages:
+            continue
+        key = (pkg, meta["arch"])
+        groups.setdefault(key, []).append((meta["version"], meta["pool_path"]))
+    return groups
+
+
+def _select_versions_to_remove(versions: list[tuple[str, Path]], keep: int
+                               ) -> tuple[list[tuple[str, Path]],
+                                          list[tuple[str, Path]]]:
+    """Split (version, path) entries into (to_keep, to_remove), newest first.
+
+    Sorting uses apt_pkg.version_compare so Debian version ordering is
+    respected (epochs, tildes, revisions): e.g. 2:1.0 > 1.0, 1.0-2 > 1.0-1,
+    1.0 > 1.0~rc1.
+    """
+    sorted_versions = sorted(
+        versions,
+        key=functools.cmp_to_key(
+            lambda a, b: apt_pkg.version_compare(a[0], b[0])
+        ),
+        reverse=True,
+    )
+    return sorted_versions[:keep], sorted_versions[keep:]
+
+
 def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
               components: list[str] | None, packages: list[str] | None,
               dry_run: bool):
@@ -1312,13 +1370,7 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
         die("--keep must be at least 1.")
 
     base_dir = cfg["base_dir"]
-
-    # Resolve dist list
-    target_dists = []
-    for d in (dists or list(cfg["dists"])):
-        if d not in cfg["dists"]:
-            die(f"Unknown dist '{d}'.")
-        target_dists.append(d)
+    target_dists = _resolve_prune_dists(cfg, dists)
 
     mode = "[DRY RUN] " if dry_run else ""
     print(f"{mode}Pruning: keep {keep} version(s) per package per arch")
@@ -1340,57 +1392,23 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
         ]
 
         for component in target_components:
-            # Gather all entries for this dist+component, grouped by
-            # (package_name, arch) -> list of (version, pool_path)
-            groups: dict[tuple[str, str], list[tuple[str, Path]]] = {}
-
-            for meta in scan_pool(base_dir, dist_name, component):
-                pkg = meta["package"]
-                arch = meta["arch"]
-                ver = meta["version"]
-                if packages is not None and pkg not in packages:
-                    continue
-                key = (pkg, arch)
-                groups.setdefault(key, []).append((ver, meta["pool_path"]))
+            groups = _group_pool_versions(base_dir, dist_name, component, packages)
 
             for (pkg, arch), versions in sorted(groups.items()):
                 if len(versions) <= keep:
                     continue  # nothing to prune here
 
-                # Sort newest-first using proper Debian version ordering.
-                # apt_pkg.version_compare understands epochs, tildes, etc.,
-                # which a plain string sort would get wrong.
-                sorted_versions = sorted(
-                    versions,
-                    key=functools.cmp_to_key(
-                        lambda a, b: apt_pkg.version_compare(a[0], b[0])
-                    ),
-                    reverse=True,
-                )
-
-                to_keep = sorted_versions[:keep]
-                to_remove = sorted_versions[keep:]
-
-                keep_str = ", ".join(v for v, _ in to_keep)
-                remove_str = ", ".join(v for v, _ in to_remove)
+                to_keep, to_remove = _select_versions_to_remove(versions, keep)
 
                 print(
                     f"  {dist_name}/{component}  {pkg} [{arch}]:\n"
-                    f"    keep:   {keep_str}\n"
-                    f"    remove: {remove_str}"
+                    f"    keep:   {', '.join(v for v, _ in to_keep)}\n"
+                    f"    remove: {', '.join(v for v, _ in to_remove)}"
                 )
 
                 if not dry_run:
                     for _ver, pool_path in to_remove:
-                        pool_path.unlink()
-                        # Clean up empty parent dirs
-                        for parent in (pool_path.parent,
-                                       pool_path.parent.parent,
-                                       pool_path.parent.parent.parent):
-                            try:
-                                parent.rmdir()
-                            except OSError:
-                                break
+                        remove_pool_file(pool_path)
                     dists_to_update.add(dist_name)
 
                 total_removed += len(to_remove)
