@@ -40,7 +40,6 @@ import apt_inst
 import apt_pkg
 import yaml
 
-apt_pkg.init()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -58,6 +57,19 @@ _STRIP_FIELDS = {"Filename", "Size", "MD5sum", "SHA1", "SHA256", "SHA512"}
 _PKG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]+$")          # package / source name
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+~:-]*$")  # epoch:upstream-revision
 _ARCH_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")            # amd64, arm64, all, ...
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def die(msg: str):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg: str):
+    print(f"WARNING: {msg}", file=sys.stderr)
 
 
 def _is_safe_basename(name: str) -> bool:
@@ -90,86 +102,17 @@ def validate_deb_identifiers(package: str, source: str,
         raise ValueError(f"Invalid architecture: {arch!r}")
 
 
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
-CONFIG_DEFAULTS = {
-    "components": ["main"],
-    "architectures": ["amd64"],
-    "sign_with": None,          # GPG key-id, or None to skip signing
-    "suite": None,              # falls back to dist name if None
-    "label": None,
-    "origin": None,
-    "description": None,
-    "allowed_signers": [],      # list of GPG key-ids allowed to sign .changes files
-}
+def _move_to(src: Path, dest_dir: Path):
+    """Move a file to dest_dir, appending a timestamp if name already exists."""
+    dest = dest_dir / src.name
+    if dest.exists():
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = dest_dir / f"{src.stem}.{ts}{src.suffix}"
+    shutil.move(str(src), dest)
 
 
-def load_config(path: Path) -> dict:
-    with open(path) as f:
-        raw = yaml.safe_load(f)
-
-    if "repo" not in raw:
-        die("Config must have a top-level 'repo' section.")
-    if "dists" not in raw:
-        die("Config must have a top-level 'dists' section.")
-
-    repo = raw["repo"]
-    if "base_dir" not in repo:
-        die("Config 'repo.base_dir' is required.")
-
-    defaults = {**CONFIG_DEFAULTS, **raw.get("defaults", {})}
-
-    dists = {}
-    for name, overrides in raw["dists"].items():
-        cfg = {**defaults, **(overrides or {})}
-        cfg["name"] = name
-        # normalise lists
-        for key in ("components", "architectures"):
-            if isinstance(cfg[key], str):
-                cfg[key] = [cfg[key]]
-        dists[name] = cfg
-
-    for name, dist_cfg in dists.items():
-        # Normalise allowed_signers: always a list of strings.
-        signers = dist_cfg.get("allowed_signers") or []
-        if isinstance(signers, str):
-            signers = [signers]
-        dist_cfg["allowed_signers"] = [str(s) for s in signers]
-
-        # sign_with is passed verbatim to gpg as a key id, so it MUST be a
-        # string.  YAML silently parses unquoted values like 0xDEADBEEF (hex)
-        # or all-digit key ids as integers, and str() of those would not round
-        # trip to the intended key id -- so refuse rather than guess.
-        sign_with = dist_cfg.get("sign_with")
-        if sign_with is not None and not isinstance(sign_with, str):
-            die(
-                f"Config error: 'sign_with' for dist '{name}' must be a quoted "
-                f"string, but YAML parsed it as {type(sign_with).__name__} "
-                f"({sign_with!r}). Quote the key id in the config, e.g.:\n"
-                f"    sign_with: \"0xDEADBEEFCAFEBABE\""
-            )
-
-        # Free-text fields: coerce to str so number-like values (e.g. a suite
-        # named '12') don't break path building or Release generation.
-        for key in ("suite", "origin", "label", "description"):
-            if dist_cfg.get(key) is not None:
-                dist_cfg[key] = str(dist_cfg[key])
-
-    incoming_dir = repo.get("incoming_dir")
-    signer_keyring = repo.get("signer_keyring")
-
-    return {
-        "base_dir": Path(repo["base_dir"]).expanduser(),
-        "incoming_dir": Path(incoming_dir).expanduser() if incoming_dir else None,
-        "signer_keyring": Path(signer_keyring).expanduser() if signer_keyring else None,
-        "dists": dists,
-    }
-
-
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # Path helpers
-# ---------------------------------------------------------------------------
 
 def pool_prefix(source_name: str) -> str:
     """Return the first-level pool prefix for a source package name.
@@ -198,9 +141,8 @@ def packages_path(base_dir: Path, dist: str, component: str, arch: str) -> Path:
     return dists_path(base_dir, dist) / component / f"binary-{arch}"
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # .deb metadata extraction
-# ---------------------------------------------------------------------------
 
 def read_deb(deb_path: Path) -> dict:
     """Extract control fields + file hashes from a .deb.  Returns a dict."""
@@ -252,9 +194,8 @@ def read_deb(deb_path: Path) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # Packages index building
-# ---------------------------------------------------------------------------
 
 def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
     """Produce one stanza for a Packages index file."""
@@ -300,9 +241,8 @@ def write_packages_index(entries: list[bytes], dest_dir: Path):
         f.write(raw)
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # Pool management
-# ---------------------------------------------------------------------------
 
 def add_to_pool(base_dir: Path, dist: str, component: str,
                 meta: dict, src_path: Path) -> Path:
@@ -351,9 +291,8 @@ def scan_pool(base_dir: Path, dist: str, component: str) -> list[dict]:
     return entries
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # Release file generation
-# ---------------------------------------------------------------------------
 
 def _hash_file(path: Path) -> dict:
     with open(path, "rb") as f:
@@ -429,9 +368,8 @@ def build_release(base_dir: Path, dist_cfg: dict):
     return release_path
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # GPG signing
-# ---------------------------------------------------------------------------
 
 def sign_release(release_path: Path, key_id: str):
     """Produce Release.gpg (detached) and InRelease (clearsigned)."""
@@ -471,97 +409,8 @@ def _run_gpg(cmd: list):
         )
 
 
-# ---------------------------------------------------------------------------
-# High-level operations
-# ---------------------------------------------------------------------------
-
-def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
-            component: str | None = None):
-    """Add one or more .deb files to a dist."""
-    if dist_name not in cfg["dists"]:
-        die(f"Unknown dist '{dist_name}'. Known: {', '.join(cfg['dists'])}")
-
-    dist_cfg = cfg["dists"][dist_name]
-    base_dir = cfg["base_dir"]
-
-    if component is None:
-        component = dist_cfg["components"][0]
-    elif component not in dist_cfg["components"]:
-        die(
-            f"Component '{component}' is not configured for dist '{dist_name}'. "
-            f"Known components: {', '.join(dist_cfg['components'])}"
-        )
-
-    for deb_path in deb_paths:
-        if not deb_path.exists():
-            warn(f"File not found, skipping: {deb_path}")
-            continue
-
-        print(f"\nAdding {deb_path.name} -> {dist_name}/{component}")
-        try:
-            meta = read_deb(deb_path)
-        except ValueError as e:
-            die(f"Refusing to add {deb_path.name}: {e}")
-        print(f"  Package: {meta['package']}  Version: {meta['version']}  Arch: {meta['arch']}")
-        print(f"  Source:  {meta['source']}")
-
-        if meta["arch"] not in dist_cfg["architectures"] and meta["arch"] != "all":
-            warn(
-                f"Architecture '{meta['arch']}' is not listed for dist '{dist_name}' "
-                f"({', '.join(dist_cfg['architectures'])}). Adding anyway."
-            )
-
-        add_to_pool(base_dir, dist_name, component, meta, deb_path)
-
-    # Regenerate indices for this dist
-    update_dist(cfg, dist_name)
-    write_repo_metadata(cfg)
-
-
-def cmd_remove(cfg: dict, dist_name: str,
-               package: str, version: str, arch: str | None):
-    """Remove a package version from the pool and regenerate indices."""
-    if dist_name not in cfg["dists"]:
-        die(f"Unknown dist '{dist_name}'.")
-
-    dist_cfg = cfg["dists"][dist_name]
-    base_dir = cfg["base_dir"]
-    removed = 0
-
-    for component in dist_cfg["components"]:
-        pool_dir = base_dir / "pool" / dist_name / component
-        if not pool_dir.exists():
-            continue
-        for deb_path in sorted(pool_dir.rglob("*.deb")):
-            try:
-                meta = read_deb(deb_path)
-            except Exception:
-                continue
-            if meta["package"] != package:
-                continue
-            if meta["version"] != version:
-                continue
-            if arch and meta["arch"] != arch:
-                continue
-            print(f"  [remove] {deb_path.relative_to(base_dir)}")
-            deb_path.unlink()
-            # clean empty dirs
-            for parent in (deb_path.parent, deb_path.parent.parent,
-                           deb_path.parent.parent.parent):
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
-            removed += 1
-
-    if removed == 0:
-        warn(f"No matching packages found for {package} {version}" +
-             (f" {arch}" if arch else ""))
-    else:
-        print(f"  Removed {removed} file(s).")
-        update_dist(cfg, dist_name)
-        write_repo_metadata(cfg)
-
+# ---------------------------------------------
+# update dist
 
 def update_dist(cfg: dict, dist_name: str):
     """Regenerate Packages indices and Release file for one dist."""
@@ -622,9 +471,8 @@ def _entry_sort_key(entry: bytes) -> tuple:
         return ("", "")
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # Signature verification (Sequoia-PGP via the pysequoia bindings)
-# ---------------------------------------------------------------------------
 
 def _import_pysequoia():
     """Import pysequoia lazily so commands that don't verify signatures
@@ -756,9 +604,8 @@ def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------
 # .changes file parsing
-# ---------------------------------------------------------------------------
 
 def _parse_hash_field(field_value: str) -> dict[str, dict]:
     """Parse a multi-line Checksums-* or Files field into {filename: {hash/size}}."""
@@ -911,8 +758,312 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
     return verified
 
 
+# ---------------------------------------------
+# Repo metadata
+
+def build_repo_json(cfg: dict) -> dict:
+    """Build the repo.json structure from the loaded config."""
+    dists_out = {}
+    for name, dist_cfg in cfg["dists"].items():
+        dists_out[name] = {
+            "components":    dist_cfg["components"],
+            "architectures": dist_cfg["architectures"],
+            "description":   dist_cfg.get("description") or "",
+        }
+    return {"dists": dists_out}
+
+
+def write_repo_metadata(cfg: dict):
+    """Write repo.json to the repo base directory.
+
+    repo.json describes the dist/component/architecture structure of the repo
+    and is consumed by the static browser index (index.html) served by nginx.
+    """
+    base_dir = cfg["base_dir"]
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_json_path = base_dir / "repo.json"
+    repo_data = build_repo_json(cfg)
+    repo_json_path.write_text(
+        json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n"
+    )
+    print(f"  [meta] Written: repo.json")
+
+
 # ---------------------------------------------------------------------------
-# ingest command
+# configuration management
+# ---------------------------------------------------------------------------
+
+CONFIG_DEFAULTS = {
+    "components": ["main"],
+    "architectures": ["amd64"],
+    "sign_with": None,          # GPG key-id, or None to skip signing
+    "suite": None,              # falls back to dist name if None
+    "label": None,
+    "origin": None,
+    "description": None,
+    "allowed_signers": [],      # list of GPG key-ids allowed to sign .changes files
+}
+
+
+def load_config(path: Path) -> dict:
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    if "repo" not in raw:
+        die("Config must have a top-level 'repo' section.")
+    if "dists" not in raw:
+        die("Config must have a top-level 'dists' section.")
+
+    repo = raw["repo"]
+    if "base_dir" not in repo:
+        die("Config 'repo.base_dir' is required.")
+
+    defaults = {**CONFIG_DEFAULTS, **raw.get("defaults", {})}
+
+    dists = {}
+    for name, overrides in raw["dists"].items():
+        cfg = {**defaults, **(overrides or {})}
+        cfg["name"] = name
+        # normalise lists
+        for key in ("components", "architectures"):
+            if isinstance(cfg[key], str):
+                cfg[key] = [cfg[key]]
+        dists[name] = cfg
+
+    for name, dist_cfg in dists.items():
+        # Normalise allowed_signers: always a list of strings.
+        signers = dist_cfg.get("allowed_signers") or []
+        if isinstance(signers, str):
+            signers = [signers]
+        dist_cfg["allowed_signers"] = [str(s) for s in signers]
+
+        # sign_with is passed verbatim to gpg as a key id, so it MUST be a
+        # string.  YAML silently parses unquoted values like 0xDEADBEEF (hex)
+        # or all-digit key ids as integers, and str() of those would not round
+        # trip to the intended key id -- so refuse rather than guess.
+        sign_with = dist_cfg.get("sign_with")
+        if sign_with is not None and not isinstance(sign_with, str):
+            die(
+                f"Config error: 'sign_with' for dist '{name}' must be a quoted "
+                f"string, but YAML parsed it as {type(sign_with).__name__} "
+                f"({sign_with!r}). Quote the key id in the config, e.g.:\n"
+                f"    sign_with: \"0xDEADBEEFCAFEBABE\""
+            )
+
+        # Free-text fields: coerce to str so number-like values (e.g. a suite
+        # named '12') don't break path building or Release generation.
+        for key in ("suite", "origin", "label", "description"):
+            if dist_cfg.get(key) is not None:
+                dist_cfg[key] = str(dist_cfg[key])
+
+    incoming_dir = repo.get("incoming_dir")
+    signer_keyring = repo.get("signer_keyring")
+
+    return {
+        "base_dir": Path(repo["base_dir"]).expanduser(),
+        "incoming_dir": Path(incoming_dir).expanduser() if incoming_dir else None,
+        "signer_keyring": Path(signer_keyring).expanduser() if signer_keyring else None,
+        "dists": dists,
+    }
+
+
+# ---------------------------------------------------------------------------
+# command: init
+# ---------------------------------------------------------------------------
+
+def cmd_init(cfg: dict):
+    """Create the directory structure for all configured dists."""
+    base_dir = cfg["base_dir"]
+    base_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Initialising repo at {base_dir}")
+    for dist_name, dist_cfg in cfg["dists"].items():
+        for component in dist_cfg["components"]:
+            for arch in dist_cfg["architectures"]:
+                d = packages_path(base_dir, dist_name, component, arch)
+                d.mkdir(parents=True, exist_ok=True)
+                idx = d / "Packages"
+                if not idx.exists():
+                    idx.write_bytes(b"")
+        print(f"  Created structure for dist '{dist_name}'")
+
+        # If suite differs from the dist name, create a symlink so clients
+        # using either name can find the dist.
+        # e.g. dist 'bookworm' with suite 'stable' -> dists/stable -> bookworm
+        suite = dist_cfg.get("suite")
+        if suite and suite != dist_name:
+            suite_link = dists_path(base_dir, suite)
+            if suite_link.is_symlink():
+                if suite_link.resolve() == dists_path(base_dir, dist_name).resolve():
+                    print(f"  Suite symlink already up to date: dists/{suite} -> {dist_name}")
+                else:
+                    old_target = os.readlink(suite_link)
+                    suite_link.unlink()
+                    suite_link.symlink_to(dist_name)
+                    print(f"  Updated suite symlink: dists/{suite} -> {dist_name} (was {old_target})")
+            elif suite_link.exists():
+                warn(
+                    f"Cannot create suite symlink dists/{suite} -> {dist_name}: "
+                    f"path exists and is not a symlink."
+                )
+            else:
+                suite_link.symlink_to(dist_name)
+                print(f"  Created suite symlink: dists/{suite} -> {dist_name}")
+
+    write_repo_metadata(cfg)
+    print("Done.")
+
+
+# ---------------------------------------------------------------------------
+# command: add
+# ---------------------------------------------------------------------------
+
+def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
+            component: str | None = None):
+    """Add one or more .deb files to a dist."""
+    if dist_name not in cfg["dists"]:
+        die(f"Unknown dist '{dist_name}'. Known: {', '.join(cfg['dists'])}")
+
+    dist_cfg = cfg["dists"][dist_name]
+    base_dir = cfg["base_dir"]
+
+    if component is None:
+        component = dist_cfg["components"][0]
+    elif component not in dist_cfg["components"]:
+        die(
+            f"Component '{component}' is not configured for dist '{dist_name}'. "
+            f"Known components: {', '.join(dist_cfg['components'])}"
+        )
+
+    for deb_path in deb_paths:
+        if not deb_path.exists():
+            warn(f"File not found, skipping: {deb_path}")
+            continue
+
+        print(f"\nAdding {deb_path.name} -> {dist_name}/{component}")
+        try:
+            meta = read_deb(deb_path)
+        except ValueError as e:
+            die(f"Refusing to add {deb_path.name}: {e}")
+        print(f"  Package: {meta['package']}  Version: {meta['version']}  Arch: {meta['arch']}")
+        print(f"  Source:  {meta['source']}")
+
+        if meta["arch"] not in dist_cfg["architectures"] and meta["arch"] != "all":
+            warn(
+                f"Architecture '{meta['arch']}' is not listed for dist '{dist_name}' "
+                f"({', '.join(dist_cfg['architectures'])}). Adding anyway."
+            )
+
+        add_to_pool(base_dir, dist_name, component, meta, deb_path)
+
+    # Regenerate indices for this dist
+    update_dist(cfg, dist_name)
+    write_repo_metadata(cfg)
+
+
+# ---------------------------------------------------------------------------
+# command: remove
+# ---------------------------------------------------------------------------
+
+def cmd_remove(cfg: dict, dist_name: str,
+               package: str, version: str, arch: str | None):
+    """Remove a package version from the pool and regenerate indices."""
+    if dist_name not in cfg["dists"]:
+        die(f"Unknown dist '{dist_name}'.")
+
+    dist_cfg = cfg["dists"][dist_name]
+    base_dir = cfg["base_dir"]
+    removed = 0
+
+    for component in dist_cfg["components"]:
+        pool_dir = base_dir / "pool" / dist_name / component
+        if not pool_dir.exists():
+            continue
+        for deb_path in sorted(pool_dir.rglob("*.deb")):
+            try:
+                meta = read_deb(deb_path)
+            except Exception:
+                continue
+            if meta["package"] != package:
+                continue
+            if meta["version"] != version:
+                continue
+            if arch and meta["arch"] != arch:
+                continue
+            print(f"  [remove] {deb_path.relative_to(base_dir)}")
+            deb_path.unlink()
+            # clean empty dirs
+            for parent in (deb_path.parent, deb_path.parent.parent,
+                           deb_path.parent.parent.parent):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+            removed += 1
+
+    if removed == 0:
+        warn(f"No matching packages found for {package} {version}" +
+             (f" {arch}" if arch else ""))
+    else:
+        print(f"  Removed {removed} file(s).")
+        update_dist(cfg, dist_name)
+        write_repo_metadata(cfg)
+
+
+# ---------------------------------------------------------------------------
+# command: update
+# ---------------------------------------------------------------------------
+
+def cmd_update(cfg: dict, dist_name: str | None):
+    """Regenerate indices for one or all dists."""
+    dists = [dist_name] if dist_name else list(cfg["dists"])
+    for d in dists:
+        if d not in cfg["dists"]:
+            die(f"Unknown dist '{d}'.")
+        update_dist(cfg, d)
+    write_repo_metadata(cfg)
+
+
+# ---------------------------------------------------------------------------
+# command: list
+# ---------------------------------------------------------------------------
+
+def cmd_list(cfg: dict, dist_name: str | None):
+    """List packages in one or all dists."""
+    base_dir = cfg["base_dir"]
+    dists = [dist_name] if dist_name else list(cfg["dists"])
+
+    for dist_name in dists:
+        if dist_name not in cfg["dists"]:
+            warn(f"Unknown dist '{dist_name}', skipping.")
+            continue
+        dist_cfg = cfg["dists"][dist_name]
+        print(f"\n{'='*60}")
+        print(f"Dist: {dist_name}  ({', '.join(dist_cfg['components'])} | "
+              f"{', '.join(dist_cfg['architectures'])})")
+        print(f"{'='*60}")
+
+        all_entries = []
+        for component in dist_cfg["components"]:
+            for meta in scan_pool(base_dir, dist_name, component):
+                all_entries.append((component, meta))
+
+        if not all_entries:
+            print("  (empty)")
+            continue
+
+        all_entries.sort(key=lambda x: (x[1]["package"], x[1]["version"], x[1]["arch"]))
+        fmt = "  {:<30}  {:<20}  {:<8}  {}"
+        print(fmt.format("Package", "Version", "Arch", "Component"))
+        print("  " + "-" * 70)
+        for component, meta in all_entries:
+            print(fmt.format(
+                meta["package"], meta["version"], meta["arch"], component
+            ))
+
+
+# ---------------------------------------------------------------------------
+# command: ingest
 # ---------------------------------------------------------------------------
 
 def cmd_ingest(cfg: dict, incoming_dir: Path | None):
@@ -1071,58 +1222,9 @@ def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
     print(f"  [OK] Moved to done/")
 
 
-def _move_to(src: Path, dest_dir: Path):
-    """Move a file to dest_dir, appending a timestamp if name already exists."""
-    dest = dest_dir / src.name
-    if dest.exists():
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        dest = dest_dir / f"{src.stem}.{ts}{src.suffix}"
-    shutil.move(str(src), dest)
-
-
-def cmd_update(cfg: dict, dist_name: str | None):
-    """Regenerate indices for one or all dists."""
-    dists = [dist_name] if dist_name else list(cfg["dists"])
-    for d in dists:
-        if d not in cfg["dists"]:
-            die(f"Unknown dist '{d}'.")
-        update_dist(cfg, d)
-    write_repo_metadata(cfg)
-
-
-def cmd_list(cfg: dict, dist_name: str | None):
-    """List packages in one or all dists."""
-    base_dir = cfg["base_dir"]
-    dists = [dist_name] if dist_name else list(cfg["dists"])
-
-    for dist_name in dists:
-        if dist_name not in cfg["dists"]:
-            warn(f"Unknown dist '{dist_name}', skipping.")
-            continue
-        dist_cfg = cfg["dists"][dist_name]
-        print(f"\n{'='*60}")
-        print(f"Dist: {dist_name}  ({', '.join(dist_cfg['components'])} | "
-              f"{', '.join(dist_cfg['architectures'])})")
-        print(f"{'='*60}")
-
-        all_entries = []
-        for component in dist_cfg["components"]:
-            for meta in scan_pool(base_dir, dist_name, component):
-                all_entries.append((component, meta))
-
-        if not all_entries:
-            print("  (empty)")
-            continue
-
-        all_entries.sort(key=lambda x: (x[1]["package"], x[1]["version"], x[1]["arch"]))
-        fmt = "  {:<30}  {:<20}  {:<8}  {}"
-        print(fmt.format("Package", "Version", "Arch", "Component"))
-        print("  " + "-" * 70)
-        for component, meta in all_entries:
-            print(fmt.format(
-                meta["package"], meta["version"], meta["arch"], component
-            ))
-
+# ---------------------------------------------------------------------------
+# command: prune
+# ---------------------------------------------------------------------------
 
 def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
               components: list[str] | None, packages: list[str] | None,
@@ -1243,120 +1345,23 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
 
 
 # ---------------------------------------------------------------------------
-# Repo metadata
-# ---------------------------------------------------------------------------
-
-def build_repo_json(cfg: dict) -> dict:
-    """Build the repo.json structure from the loaded config."""
-    dists_out = {}
-    for name, dist_cfg in cfg["dists"].items():
-        dists_out[name] = {
-            "components":    dist_cfg["components"],
-            "architectures": dist_cfg["architectures"],
-            "description":   dist_cfg.get("description") or "",
-        }
-    return {"dists": dists_out}
-
-
-def write_repo_metadata(cfg: dict):
-    """Write repo.json to the repo base directory.
-
-    repo.json describes the dist/component/architecture structure of the repo
-    and is consumed by the static browser index (index.html) served by nginx.
-    """
-    base_dir = cfg["base_dir"]
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    repo_json_path = base_dir / "repo.json"
-    repo_data = build_repo_json(cfg)
-    repo_json_path.write_text(
-        json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n"
-    )
-    print(f"  [meta] Written: repo.json")
-
-
-def cmd_init(cfg: dict):
-    """Create the directory structure for all configured dists."""
-    base_dir = cfg["base_dir"]
-    base_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Initialising repo at {base_dir}")
-    for dist_name, dist_cfg in cfg["dists"].items():
-        for component in dist_cfg["components"]:
-            for arch in dist_cfg["architectures"]:
-                d = packages_path(base_dir, dist_name, component, arch)
-                d.mkdir(parents=True, exist_ok=True)
-                idx = d / "Packages"
-                if not idx.exists():
-                    idx.write_bytes(b"")
-        print(f"  Created structure for dist '{dist_name}'")
-
-        # If suite differs from the dist name, create a symlink so clients
-        # using either name can find the dist.
-        # e.g. dist 'bookworm' with suite 'stable' -> dists/stable -> bookworm
-        suite = dist_cfg.get("suite")
-        if suite and suite != dist_name:
-            suite_link = dists_path(base_dir, suite)
-            if suite_link.is_symlink():
-                if suite_link.resolve() == dists_path(base_dir, dist_name).resolve():
-                    print(f"  Suite symlink already up to date: dists/{suite} -> {dist_name}")
-                else:
-                    old_target = os.readlink(suite_link)
-                    suite_link.unlink()
-                    suite_link.symlink_to(dist_name)
-                    print(f"  Updated suite symlink: dists/{suite} -> {dist_name} (was {old_target})")
-            elif suite_link.exists():
-                warn(
-                    f"Cannot create suite symlink dists/{suite} -> {dist_name}: "
-                    f"path exists and is not a symlink."
-                )
-            else:
-                suite_link.symlink_to(dist_name)
-                print(f"  Created suite symlink: dists/{suite} -> {dist_name}")
-
-    write_repo_metadata(cfg)
-    print("Done.")
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def die(msg: str):
-    print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def warn(msg: str):
-    print(f"WARNING: {msg}", file=sys.stderr)
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Private APT repository manager",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "-c", "--config",
-        default="/etc/whawty/aptrepo.yml",
-        help="Path to config file (default: /etc/whawty/aptrepo.yml)",
-    )
+    parser = argparse.ArgumentParser(description="Private APT repository manager", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    parser.add_argument("-c", "--config", default="/etc/whawty/aptrepo.yml", help="Path to config file (default: /etc/whawty/aptrepo.yml)")
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
+    # init
+    p_ini = sub.add_parser("init", help="Initialise directory structure")
+
     # add
     p_add = sub.add_parser("add", help="Add .deb file(s) to a dist")
     p_add.add_argument("dist", help="Target distribution name")
-    p_add.add_argument(
-        "-C", "--component",
-        default=None,
-        help="Component to add to (default: first component configured for the dist)",
-    )
+    p_add.add_argument("-C", "--component", default=None, help="Component to add to (default: first component configured for the dist)")
     p_add.add_argument("debs", nargs="+", metavar="file.deb", help=".deb file(s) to add")
 
     # remove
@@ -1364,66 +1369,36 @@ def main():
     p_rem.add_argument("dist", help="Distribution name")
     p_rem.add_argument("package", help="Package name")
     p_rem.add_argument("version", help="Package version")
-    p_rem.add_argument("arch", nargs="?", default=None,
-                       help="Architecture (optional; removes all if omitted)")
+    p_rem.add_argument("arch", nargs="?", default=None, help="Architecture (optional; removes all if omitted)")
 
     # update
     p_upd = sub.add_parser("update", help="Regenerate indices (all dists or one)")
-    p_upd.add_argument("dist", nargs="?", default=None,
-                       help="Dist to update (default: all)")
+    p_upd.add_argument("dist", nargs="?", default=None, help="Dist to update (default: all)")
 
     # list
     p_lst = sub.add_parser("list", help="List packages")
-    p_lst.add_argument("dist", nargs="?", default=None,
-                       help="Dist to list (default: all)")
+    p_lst.add_argument("dist", nargs="?", default=None, help="Dist to list (default: all)")
 
     # ingest
-    p_inc = sub.add_parser(
-        "ingest",
-        help="Ingest signed .changes files from the incoming directory",
-    )
-    p_inc.add_argument(
-        "incoming_dir",
-        nargs="?",
-        default=None,
-        help="Incoming directory (overrides repo.incoming_dir from config)",
-    )
+    p_ing = sub.add_parser("ingest", help="Ingest signed .changes files from the incoming directory")
+    p_ing.add_argument("incoming_dir", nargs="?", default=None, help="Incoming directory (overrides repo.incoming_dir from config)")
 
     # prune
-    p_prn = sub.add_parser(
-        "prune",
-        help="Remove old package versions, keeping the N newest per package",
-    )
-    p_prn.add_argument(
-        "keep", type=int, metavar="N",
-        help="Number of versions to keep per package per arch",
-    )
-    p_prn.add_argument(
-        "-d", "--dist", dest="dists", action="append", metavar="DIST",
-        help="Limit to this dist (repeatable; default: all dists)",
-    )
-    p_prn.add_argument(
-        "-C", "--component", dest="components", action="append", metavar="COMPONENT",
-        help="Limit to this component (repeatable; default: all components)",
-    )
-    p_prn.add_argument(
-        "-p", "--package", dest="packages", action="append", metavar="PACKAGE",
-        help="Limit to this package name (repeatable; default: all packages)",
-    )
-    p_prn.add_argument(
-        "-n", "--dry-run", action="store_true",
-        help="Print what would be removed without actually removing anything",
-    )
-
-    # init
-    sub.add_parser("init", help="Initialise directory structure")
+    p_prn = sub.add_parser("prune", help="Remove old package versions, keeping the N newest per package")
+    p_prn.add_argument("keep", type=int, metavar="N", help="Number of versions to keep per package per arch")
+    p_prn.add_argument("-d", "--dist", dest="dists", action="append", metavar="DIST", help="Limit to this dist (repeatable; default: all dists)")
+    p_prn.add_argument("-C", "--component", dest="components", action="append", metavar="COMPONENT",
+                       help="Limit to this component (repeatable; default: all components)")
+    p_prn.add_argument("-p", "--package", dest="packages", action="append", metavar="PACKAGE",
+                       help="Limit to this package name (repeatable; default: all packages)")
+    p_prn.add_argument("-n", "--dry-run", action="store_true", help="Print what would be removed without actually removing anything")
 
     args = parser.parse_args()
-
     config_path = Path(args.config)
     if not config_path.exists():
         die(f"Config file not found: {config_path}")
     cfg = load_config(config_path)
+    apt_pkg.init()
 
     if args.command == "add":
         cmd_add(cfg, args.dist, [Path(p) for p in args.debs], args.component)
