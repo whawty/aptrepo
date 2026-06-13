@@ -112,6 +112,23 @@ def _move_to(src: Path, dest_dir: Path):
     shutil.move(str(src), dest)
 
 
+def _atomic_replace(tmp: str, dest: Path):
+    """Set the correct mode on *tmp*, then atomically rename it onto *dest*.
+
+    tempfile.mkstemp() always creates files as 0600, and os.replace() keeps
+    the tempfile's mode -- which would leave published files unreadable by the
+    web server (which usually runs as a different user).  So we apply the mode
+    a normal create would produce under the current umask (e.g. 0644 with the
+    usual umask of 022).  os.umask() is the only way to read the umask: it sets
+    and returns the previous value, so we set-and-restore. Safe here as the
+    script is single-threaded.
+    """
+    umask = os.umask(0)
+    os.umask(umask)
+    os.chmod(tmp, 0o666 & ~umask)
+    os.replace(tmp, dest)
+
+
 def _atomic_write(dest: Path, data: bytes):
     """Write *data* to *dest* atomically using a tempfile + rename."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -121,7 +138,7 @@ def _atomic_write(dest: Path, data: bytes):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, dest)
+        _atomic_replace(tmp, dest)
     except Exception:
         try:
             os.unlink(tmp)
@@ -406,7 +423,7 @@ def sign_release(release_path: Path, key_id: str):
             cmd_detach += ["--local-user", key_id]
         cmd_detach += ["--output", tmp_gpg, str(release_path)]
         _run_gpg(cmd_detach)
-        os.replace(tmp_gpg, gpg_path)
+        _atomic_replace(tmp_gpg, gpg_path)
     except Exception:
         try:
             os.unlink(tmp_gpg)
@@ -425,7 +442,7 @@ def sign_release(release_path: Path, key_id: str):
             cmd_clear += ["--local-user", key_id]
         cmd_clear += ["--output", tmp_inrelease, str(release_path)]
         _run_gpg(cmd_clear)
-        os.replace(tmp_inrelease, inrelease_path)
+        _atomic_replace(tmp_inrelease, inrelease_path)
     except Exception:
         try:
             os.unlink(tmp_inrelease)
@@ -819,9 +836,7 @@ def write_repo_metadata(cfg: dict):
 
     repo_json_path = base_dir / "repo.json"
     repo_data = build_repo_json(cfg)
-    repo_json_path.write_text(
-        json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n"
-    )
+    _atomic_write(repo_json_path, (json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n").encode())
     print(f"  [meta] Written: repo.json")
 
 
@@ -1435,7 +1450,9 @@ def main():
     cfg = load_config(config_path)
     apt_pkg.init()
 
-    if args.command == "add":
+    if args.command == "init":
+        cmd_init(cfg)
+    elif args.command == "add":
         cmd_add(cfg, args.dist, [Path(p) for p in args.debs], args.component)
     elif args.command == "remove":
         cmd_remove(cfg, args.dist, args.package, args.version, args.arch)
@@ -1446,10 +1463,7 @@ def main():
     elif args.command == "ingest":
         cmd_ingest(cfg, args.incoming_dir)
     elif args.command == "prune":
-        cmd_prune(cfg, args.keep, args.dists, args.components,
-                  args.packages, args.dry_run)
-    elif args.command == "init":
-        cmd_init(cfg)
+        cmd_prune(cfg, args.keep, args.dists, args.components, args.packages, args.dry_run)
 
 
 if __name__ == "__main__":
