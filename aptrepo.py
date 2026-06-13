@@ -103,6 +103,16 @@ def validate_deb_identifiers(package: str, source: str,
         raise ValueError(f"Invalid architecture: {arch!r}")
 
 
+def _file_sha256(path: Path) -> str | None:
+    """Return the SHA256 hex digest of *path*, or None if unavailable."""
+    with open(path, "rb") as f:
+        hashes = apt_pkg.Hashes(f)
+    return next(
+        (h.hashvalue for h in hashes.hashes if h.hashtype == "SHA256"),
+        None,
+    )
+
+
 def _move_to(src: Path, dest_dir: Path):
     """Move a file to dest_dir, appending a timestamp if name already exists."""
     dest = dest_dir / src.name
@@ -288,12 +298,7 @@ def add_to_pool(base_dir: Path, dist: str, component: str,
                      meta["source"], src_path.name)
     if dest.exists():
         # Check if it's identical by SHA256
-        with open(dest, "rb") as f:
-            existing_hashes = apt_pkg.Hashes(f)
-        existing_sha256 = next(
-            (h.hashvalue for h in existing_hashes.hashes if h.hashtype == "SHA256"),
-            None,
-        )
+        existing_sha256 = _file_sha256(dest)
         if existing_sha256 == meta["hashes"].get("SHA256"):
             print(f"  [pool] Already present (identical): {dest.relative_to(base_dir)}")
             return dest
@@ -781,12 +786,7 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
 
         # Verify SHA256 if present (preferred), fall back to MD5
         if entry.get("sha256"):
-            with open(deb_path, "rb") as f:
-                hashes = apt_pkg.Hashes(f)
-            actual_sha256 = next(
-                (h.hashvalue for h in hashes.hashes if h.hashtype == "SHA256"),
-                None,
-            )
+            actual_sha256 = _file_sha256(deb_path)
             if actual_sha256 != entry["sha256"]:
                 errors.append(
                     f"  SHA256 mismatch for {fname}: "
