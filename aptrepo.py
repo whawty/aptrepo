@@ -1116,6 +1116,120 @@ def cmd_list(cfg: dict, dist_name: str | None):
 # command: ingest
 # ---------------------------------------------------------------------------
 
+def _authorise_signer(dist_name: str, dist_cfg: dict,
+                      valid_fingerprints: list[str]) -> str:
+    """Enforce the per-dist allow-list against already-verified signatures.
+
+    *valid_fingerprints* are the certificate fingerprints that produced a
+    cryptographically valid signature.  This function decides whether any of
+    them is permitted to upload to *dist_name*.  Returns the matched
+    fingerprint, or raises ValueError.
+    """
+    allowed_signers = dist_cfg.get("allowed_signers", [])
+    if not allowed_signers:
+        raise ValueError(
+            f"No allowed_signers configured for dist '{dist_name}'. "
+            f"Add at least one key fingerprint to accept uploads."
+        )
+    for kid in allowed_signers:
+        if len(_normalise_keyid(kid)) == 8:
+            warn(
+                f"Short key ID '{kid}' in allowed_signers is insecure. "
+                f"Use the full 40-char fingerprint."
+            )
+
+    matched = next((fp for fp in valid_fingerprints if _fingerprint_matches(fp, allowed_signers)), None)
+    if matched is None:
+        raise ValueError(
+            f"Valid signature(s) from {', '.join(valid_fingerprints)} but none "
+            f"are in the allowed_signers list for dist '{dist_name}'. "
+            f"Configured: {allowed_signers}"
+        )
+    return matched
+
+
+def _validate_changes_components(changes_info: dict, dist_cfg: dict):
+    """Raise if any file's component is not configured for the target dist."""
+    for entry in changes_info["files"]:
+        comp = entry["component"]
+        if comp not in dist_cfg["components"]:
+            raise ValueError(
+                f"Component '{comp}' (from .changes) is not configured for "
+                f"dist '{changes_info['distribution']}'. "
+                f"Known: {', '.join(dist_cfg['components'])}"
+            )
+
+
+def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
+                         changes_info: dict, verified_paths: list[Path]):
+    """Add every verified .deb referenced by the .changes to the pool."""
+    base_dir = cfg["base_dir"]
+    for entry, deb_path in zip(changes_info["files"], verified_paths):
+        meta = read_deb(deb_path)
+
+        if meta["arch"] not in dist_cfg["architectures"] and meta["arch"] != "all":
+            warn(
+                f"Architecture '{meta['arch']}' is not listed for dist "
+                f"'{dist_name}'. Adding anyway."
+            )
+
+        add_to_pool(base_dir, dist_name, entry["component"], meta, deb_path)
+
+
+def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
+                         certs: list, dists_to_update: set[str]):
+    """Process a single .changes file. Raises on any error."""
+
+    # Verify the signature FIRST, against the whole keyring, so that
+    # everything parsed afterwards comes from cryptographically verified
+    # bytes -- never from the raw file.
+    valid_fingerprints, payload = verify_changes_signature(changes_path, certs)
+
+    # Parse the *verified* payload.
+    try:
+        changes_info = parse_changes(payload)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not parse .changes file: {e}") from e
+
+    dist_name = changes_info["distribution"]
+    print(f"  Source:  {changes_info['source']}  {changes_info['version']}")
+    print(f"  Dist:    {dist_name}")
+
+    # Check the target dist is known.
+    if dist_name not in cfg["dists"]:
+        raise ValueError(
+            f"Distribution '{dist_name}' is not configured in this repo. "
+            f"Known dists: {', '.join(cfg['dists'])}"
+        )
+    dist_cfg = cfg["dists"][dist_name]
+
+    # Authorise: the (valid) signer must be allowed for THIS dist.
+    matched = _authorise_signer(dist_name, dist_cfg, valid_fingerprints)
+    print(f"  Signed by: {matched}")
+
+    # Check the file list, verify checksums, and validate components.
+    if not changes_info["files"]:
+        raise ValueError("No .deb files listed in .changes")
+
+    print(f"  Files ({len(changes_info['files'])}):")
+    for entry in changes_info["files"]:
+        print(f"    {entry['filename']}  [{entry['component']}/{entry['section']}]")
+
+    verified_paths = verify_changes_files(changes_info, incoming_dir)
+    _validate_changes_components(changes_info, dist_cfg)
+
+    # Add each .deb to the pool, then move processed files to done/.
+    _add_changes_to_pool(cfg, dist_name, dist_cfg, changes_info, verified_paths)
+    dists_to_update.add(dist_name)
+
+    _move_to(changes_path, incoming_dir / "done")
+    for deb_path in verified_paths:
+        _move_to(deb_path, incoming_dir / "done")
+    print(f"  [OK] Moved to done/")
+
+
 def cmd_ingest(cfg: dict, incoming_dir: Path | None):
     """Process all signed .changes files in the incoming directory."""
 
@@ -1171,105 +1285,6 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
     for dist_name in sorted(dists_to_update):
         update_dist(cfg, dist_name)
     write_repo_metadata(cfg)
-
-
-def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
-                         certs: list, dists_to_update: set[str]):
-    """Process a single .changes file. Raises on any error."""
-
-    # --- 1. Verify the signature FIRST, against the whole keyring. ---
-    # We deliberately verify before parsing so that everything we parse later
-    # comes from cryptographically verified bytes, never from the raw file.
-    valid_fingerprints, payload = verify_changes_signature(changes_path, certs)
-
-    # --- 2. Parse the *verified* payload. ---
-    try:
-        changes_info = parse_changes(payload)
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Could not parse .changes file: {e}") from e
-
-    dist_name = changes_info["distribution"]
-    print(f"  Source:  {changes_info['source']}  {changes_info['version']}")
-    print(f"  Dist:    {dist_name}")
-
-    # --- 3. Check the target dist is known. ---
-    if dist_name not in cfg["dists"]:
-        raise ValueError(
-            f"Distribution '{dist_name}' is not configured in this repo. "
-            f"Known dists: {', '.join(cfg['dists'])}"
-        )
-    dist_cfg = cfg["dists"][dist_name]
-
-    # --- 4. Authorisation: the signer must be allowed for THIS dist. ---
-    # The signature is already known to be cryptographically valid; here we
-    # enforce the per-dist allow-list.
-    allowed_signers = dist_cfg.get("allowed_signers", [])
-    if not allowed_signers:
-        raise ValueError(
-            f"No allowed_signers configured for dist '{dist_name}'. "
-            f"Add at least one key fingerprint to accept uploads."
-        )
-    for kid in allowed_signers:
-        if len(_normalise_keyid(kid)) == 8:
-            warn(
-                f"Short key ID '{kid}' in allowed_signers is insecure. "
-                f"Use the full 40-char fingerprint."
-            )
-
-    matched = next(
-        (fp for fp in valid_fingerprints
-         if _fingerprint_matches(fp, allowed_signers)),
-        None,
-    )
-    if matched is None:
-        raise ValueError(
-            f"Valid signature(s) from {', '.join(valid_fingerprints)} but none "
-            f"are in the allowed_signers list for dist '{dist_name}'. "
-            f"Configured: {allowed_signers}"
-        )
-    print(f"  Signed by: {matched}")
-
-    # --- 5. Check file list and verify checksums ---
-    if not changes_info["files"]:
-        raise ValueError("No .deb files listed in .changes")
-
-    print(f"  Files ({len(changes_info['files'])}):")
-    for entry in changes_info["files"]:
-        print(f"    {entry['filename']}  [{entry['component']}/{entry['section']}]")
-
-    verified_paths = verify_changes_files(changes_info, incoming_dir)
-
-    # --- 5. Validate components ---
-    for entry in changes_info["files"]:
-        comp = entry["component"]
-        if comp not in dist_cfg["components"]:
-            raise ValueError(
-                f"Component '{comp}' (from .changes) is not configured for "
-                f"dist '{dist_name}'. Known: {', '.join(dist_cfg['components'])}"
-            )
-
-    # --- 6. Add each .deb to the pool ---
-    base_dir = cfg["base_dir"]
-    for entry, deb_path in zip(changes_info["files"], verified_paths):
-        meta = read_deb(deb_path)
-
-        if meta["arch"] not in dist_cfg["architectures"] and meta["arch"] != "all":
-            warn(
-                f"Architecture '{meta['arch']}' is not listed for dist "
-                f"'{dist_name}'. Adding anyway."
-            )
-
-        add_to_pool(base_dir, dist_name, entry["component"], meta, deb_path)
-
-    dists_to_update.add(dist_name)
-
-    # --- 7. Move processed files to done/ ---
-    _move_to(changes_path, incoming_dir / "done")
-    for deb_path in verified_paths:
-        _move_to(deb_path, incoming_dir / "done")
-    print(f"  [OK] Moved to done/")
 
 
 # ---------------------------------------------------------------------------
