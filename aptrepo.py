@@ -872,7 +872,8 @@ CONFIG_DEFAULTS = {
 }
 
 
-def load_config(path: Path) -> dict:
+def _load_raw_config(path: Path) -> dict:
+    """Read and parse the YAML config, validating the required top-level keys."""
     with open(path) as f:
         raw = yaml.safe_load(f)
 
@@ -880,48 +881,58 @@ def load_config(path: Path) -> dict:
         die("Config must have a top-level 'repo' section.")
     if "dists" not in raw:
         die("Config must have a top-level 'dists' section.")
-
-    repo = raw["repo"]
-    if "base_dir" not in repo:
+    if "base_dir" not in raw["repo"]:
         die("Config 'repo.base_dir' is required.")
+    return raw
+
+
+def _build_dist_config(name: str, defaults: dict, overrides: dict | None) -> dict:
+    """Merge defaults+overrides for one dist and normalise/validate its values."""
+    cfg = {**defaults, **(overrides or {})}
+    cfg["name"] = name
+
+    # List fields may be given as a bare string; wrap them.
+    for key in ("components", "architectures"):
+        if isinstance(cfg[key], str):
+            cfg[key] = [cfg[key]]
+
+    # allowed_signers: always a list of strings.
+    signers = cfg.get("allowed_signers") or []
+    if isinstance(signers, str):
+        signers = [signers]
+    cfg["allowed_signers"] = [str(s) for s in signers]
+
+    # sign_with is passed verbatim to gpg as a key id, so it MUST be a string.
+    # YAML silently parses unquoted values like 0xDEADBEEF (hex) or all-digit
+    # key ids as integers, and str() of those would not round trip to the
+    # intended key id -- so refuse rather than guess.
+    sign_with = cfg.get("sign_with")
+    if sign_with is not None and not isinstance(sign_with, str):
+        die(
+            f"Config error: 'sign_with' for dist '{name}' must be a quoted "
+            f"string, but YAML parsed it as {type(sign_with).__name__} "
+            f"({sign_with!r}). Quote the key id in the config, e.g.:\n"
+            f"    sign_with: \"0xDEADBEEFCAFEBABE\""
+        )
+
+    # Free-text fields: coerce to str so number-like values (e.g. a suite
+    # named '12') don't break path building or Release generation.
+    for key in ("suite", "origin", "label", "description"):
+        if cfg.get(key) is not None:
+            cfg[key] = str(cfg[key])
+
+    return cfg
+
+
+def load_config(path: Path) -> dict:
+    raw = _load_raw_config(path)
+    repo = raw["repo"]
 
     defaults = {**CONFIG_DEFAULTS, **raw.get("defaults", {})}
-
-    dists = {}
-    for name, overrides in raw["dists"].items():
-        cfg = {**defaults, **(overrides or {})}
-        cfg["name"] = name
-        # normalise lists
-        for key in ("components", "architectures"):
-            if isinstance(cfg[key], str):
-                cfg[key] = [cfg[key]]
-        dists[name] = cfg
-
-    for name, dist_cfg in dists.items():
-        # Normalise allowed_signers: always a list of strings.
-        signers = dist_cfg.get("allowed_signers") or []
-        if isinstance(signers, str):
-            signers = [signers]
-        dist_cfg["allowed_signers"] = [str(s) for s in signers]
-
-        # sign_with is passed verbatim to gpg as a key id, so it MUST be a
-        # string.  YAML silently parses unquoted values like 0xDEADBEEF (hex)
-        # or all-digit key ids as integers, and str() of those would not round
-        # trip to the intended key id -- so refuse rather than guess.
-        sign_with = dist_cfg.get("sign_with")
-        if sign_with is not None and not isinstance(sign_with, str):
-            die(
-                f"Config error: 'sign_with' for dist '{name}' must be a quoted "
-                f"string, but YAML parsed it as {type(sign_with).__name__} "
-                f"({sign_with!r}). Quote the key id in the config, e.g.:\n"
-                f"    sign_with: \"0xDEADBEEFCAFEBABE\""
-            )
-
-        # Free-text fields: coerce to str so number-like values (e.g. a suite
-        # named '12') don't break path building or Release generation.
-        for key in ("suite", "origin", "label", "description"):
-            if dist_cfg.get(key) is not None:
-                dist_cfg[key] = str(dist_cfg[key])
+    dists = {
+        name: _build_dist_config(name, defaults, overrides)
+        for name, overrides in raw["dists"].items()
+    }
 
     incoming_dir = repo.get("incoming_dir")
     signer_keyring = repo.get("signer_keyring")
