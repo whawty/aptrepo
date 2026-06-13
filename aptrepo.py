@@ -424,50 +424,6 @@ def build_release(base_dir: Path, dist_cfg: dict):
 # ---------------------------------------------
 # GPG signing
 
-def sign_release(release_path: Path, key_id: str):
-    """Produce Release.gpg (detached) and InRelease (clearsigned).
-    """
-    base = release_path.parent
-
-    # Detached signature: Release.gpg
-    gpg_path = base / "Release.gpg"
-    fd, tmp_gpg = tempfile.mkstemp(dir=base, prefix=".tmp-")
-    os.close(fd)
-    try:
-        cmd_detach = ["gpg", "--batch", "--yes", "--armor", "--detach-sign"]
-        if key_id:
-            cmd_detach += ["--local-user", key_id]
-        cmd_detach += ["--output", tmp_gpg, str(release_path)]
-        _run_gpg(cmd_detach)
-        _atomic_replace(tmp_gpg, gpg_path)
-    except Exception:
-        try:
-            os.unlink(tmp_gpg)
-        except OSError:
-            pass
-        raise
-    print(f"  [sign] {gpg_path.name}")
-
-    # Clearsigned: InRelease
-    inrelease_path = base / "InRelease"
-    fd, tmp_inrelease = tempfile.mkstemp(dir=base, prefix=".tmp-")
-    os.close(fd)
-    try:
-        cmd_clear = ["gpg", "--batch", "--yes", "--armor", "--clearsign"]
-        if key_id:
-            cmd_clear += ["--local-user", key_id]
-        cmd_clear += ["--output", tmp_inrelease, str(release_path)]
-        _run_gpg(cmd_clear)
-        _atomic_replace(tmp_inrelease, inrelease_path)
-    except Exception:
-        try:
-            os.unlink(tmp_inrelease)
-        except OSError:
-            pass
-        raise
-    print(f"  [sign] {inrelease_path.name}")
-
-
 def _run_gpg(cmd: list):
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
@@ -475,6 +431,38 @@ def _run_gpg(cmd: list):
             f"GPG failed (exit {result.returncode}):\n"
             + result.stderr.decode(errors="replace")
         )
+
+def _gpg_sign(release_path: Path, dest: Path, key_id: str, sign_flag: str):
+    """Sign *release_path* with gpg, writing the signature atomically to *dest*.
+
+    *sign_flag* selects the signature kind: "--detach-sign" for Release.gpg or
+    "--clearsign" for InRelease.  gpg writes to a tempfile in the destination
+    directory which is then atomically renamed into place; the tempfile is
+    cleaned up if anything fails.
+    """
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
+    os.close(fd)
+    try:
+        cmd = ["gpg", "--batch", "--yes", "--armor", sign_flag]
+        if key_id:
+            cmd += ["--local-user", key_id]
+        cmd += ["--output", tmp, str(release_path)]
+        _run_gpg(cmd)
+        _atomic_replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    print(f"  [sign] {dest.name}")
+
+
+def sign_release(release_path: Path, key_id: str):
+    """Produce Release.gpg (detached) and InRelease (clearsigned)."""
+    base = release_path.parent
+    _gpg_sign(release_path, base / "Release.gpg", key_id, "--detach-sign")
+    _gpg_sign(release_path, base / "InRelease", key_id, "--clearsign")
 
 
 # ---------------------------------------------
