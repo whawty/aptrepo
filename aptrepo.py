@@ -24,6 +24,7 @@ Usage:
 import argparse
 import functools
 import gzip
+import io
 import hashlib
 import json
 import lzma
@@ -109,6 +110,25 @@ def _move_to(src: Path, dest_dir: Path):
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest = dest_dir / f"{src.stem}.{ts}{src.suffix}"
     shutil.move(str(src), dest)
+
+
+def _atomic_write(dest: Path, data: bytes):
+    """Write *data* to *dest* atomically using a tempfile + rename.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
+    try:
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------
@@ -229,16 +249,16 @@ def write_packages_index(entries: list[bytes], dest_dir: Path):
 
     raw = b"\n".join(entries) + b"\n"
 
-    plain = dest_dir / "Packages"
-    plain.write_bytes(raw)
+    buf_io = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf_io, mode="wb", mtime=0) as g:
+        g.write(raw)
+    gz_data = buf_io.getvalue()
 
-    gz = dest_dir / "Packages.gz"
-    with gzip.GzipFile(str(gz), "wb", mtime=0) as f:
-        f.write(raw)
+    xz_data = lzma.compress(raw, format=lzma.FORMAT_XZ)
 
-    xz = dest_dir / "Packages.xz"
-    with lzma.open(xz, "wb", format=lzma.FORMAT_XZ) as f:
-        f.write(raw)
+    _atomic_write(dest_dir / "Packages", raw)
+    _atomic_write(dest_dir / "Packages.gz", gz_data)
+    _atomic_write(dest_dir / "Packages.xz", xz_data)
 
 
 # ---------------------------------------------
@@ -363,7 +383,7 @@ def build_release(base_dir: Path, dist_cfg: dict):
 
     release_path = dist_dir / "Release"
     dist_dir.mkdir(parents=True, exist_ok=True)
-    release_path.write_text("\n".join(lines) + "\n")
+    _atomic_write(release_path, ("\n".join(lines) + "\n").encode())
     print(f"  [release] Written: {release_path.relative_to(base_dir)}")
     return release_path
 
@@ -372,31 +392,46 @@ def build_release(base_dir: Path, dist_cfg: dict):
 # GPG signing
 
 def sign_release(release_path: Path, key_id: str):
-    """Produce Release.gpg (detached) and InRelease (clearsigned)."""
+    """Produce Release.gpg (detached) and InRelease (clearsigned).
+    """
     base = release_path.parent
 
     # Detached signature: Release.gpg
     gpg_path = base / "Release.gpg"
-    cmd_detach = [
-        "gpg", "--batch", "--yes",
-        "--armor", "--detach-sign",
-    ]
-    if key_id:
-        cmd_detach += ["--local-user", key_id]
-    cmd_detach += ["--output", str(gpg_path), str(release_path)]
-    _run_gpg(cmd_detach)
+    fd, tmp_gpg = tempfile.mkstemp(dir=base, prefix=".tmp-")
+    os.close(fd)
+    try:
+        cmd_detach = ["gpg", "--batch", "--yes", "--armor", "--detach-sign"]
+        if key_id:
+            cmd_detach += ["--local-user", key_id]
+        cmd_detach += ["--output", tmp_gpg, str(release_path)]
+        _run_gpg(cmd_detach)
+        os.replace(tmp_gpg, gpg_path)
+    except Exception:
+        try:
+            os.unlink(tmp_gpg)
+        except OSError:
+            pass
+        raise
     print(f"  [sign] {gpg_path.name}")
 
     # Clearsigned: InRelease
     inrelease_path = base / "InRelease"
-    cmd_clear = [
-        "gpg", "--batch", "--yes",
-        "--armor", "--clearsign",
-    ]
-    if key_id:
-        cmd_clear += ["--local-user", key_id]
-    cmd_clear += ["--output", str(inrelease_path), str(release_path)]
-    _run_gpg(cmd_clear)
+    fd, tmp_inrelease = tempfile.mkstemp(dir=base, prefix=".tmp-")
+    os.close(fd)
+    try:
+        cmd_clear = ["gpg", "--batch", "--yes", "--armor", "--clearsign"]
+        if key_id:
+            cmd_clear += ["--local-user", key_id]
+        cmd_clear += ["--output", tmp_inrelease, str(release_path)]
+        _run_gpg(cmd_clear)
+        os.replace(tmp_inrelease, inrelease_path)
+    except Exception:
+        try:
+            os.unlink(tmp_inrelease)
+        except OSError:
+            pass
+        raise
     print(f"  [sign] {inrelease_path.name}")
 
 
