@@ -113,15 +113,14 @@ def _move_to(src: Path, dest_dir: Path):
 
 
 def _atomic_write(dest: Path, data: bytes):
-    """Write *data* to *dest* atomically using a tempfile + rename.
-    """
+    """Write *data* to *dest* atomically using a tempfile + rename."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
     try:
-        try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, dest)
     except Exception:
         try:
@@ -202,8 +201,10 @@ def read_deb(deb_path: Path) -> dict:
         elif hs.hashtype == "Checksum-FileSize":
             size = hs.hashvalue
 
+    if size is None:
+        size = os.path.getsize(deb_path)
+
     return {
-        "section": section,
         "ctrl_text": ctrl_text,
         "package": package,
         "version": version,
@@ -219,10 +220,9 @@ def read_deb(deb_path: Path) -> dict:
 
 def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
     """Produce one stanza for a Packages index file."""
-    section = meta["section"]
     ctrl_text = meta["ctrl_text"]
 
-    # Re-parse so we have a fresh TagSection (the original might be shared)
+    # Parse a fresh TagSection from the stored control text.
     section = apt_pkg.TagSection(ctrl_text)
 
     rewrites = [
