@@ -12,13 +12,13 @@ Features:
   - Static browsable HTML index with live Packages parsing
 
 Usage:
+  aptrepo.py init
   aptrepo.py add              <dist> [-C <component>] <file.deb> [file.deb ...]
   aptrepo.py remove           <dist> <package> <version> [<arch>]
-  aptrepo.py ingest           [<incoming_dir>]
-  aptrepo.py prune            <n> [options]
   aptrepo.py update           [<dist>]
   aptrepo.py list             [<dist>]
-  aptrepo.py init
+  aptrepo.py ingest           [<incoming_dir>]
+  aptrepo.py prune            <n> [options]
 """
 
 import argparse
@@ -528,7 +528,7 @@ def _entry_sort_key(entry: bytes) -> tuple:
 
 def _import_pysequoia():
     """Import pysequoia lazily so commands that don't verify signatures
-    (add, remove, prune, list, update, init) work without the dependency.
+    (init, add, remove, update, list, prune) work without the dependency.
 
     Returns the (Cert, verify) pair. Raises a clear error if unavailable.
     """
