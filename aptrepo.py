@@ -1041,22 +1041,16 @@ def cmd_remove(cfg: dict, dist_name: str,
     removed = 0
 
     for component in dist_cfg["components"]:
-        pool_dir = base_dir / "pool" / dist_name / component
-        if not pool_dir.exists():
-            continue
-        for deb_path in sorted(pool_dir.rglob("*.deb")):
-            try:
-                meta = read_deb(deb_path)
-            except Exception:
-                continue
+        for meta in scan_pool(base_dir, dist_name, component):
             if meta["package"] != package:
                 continue
             if meta["version"] != version:
                 continue
             if arch and meta["arch"] != arch:
                 continue
-            print(f"  [remove] {deb_path.relative_to(base_dir)}")
-            remove_pool_file(deb_path)
+            pool_path = meta["pool_path"]
+            print(f"  [remove] {pool_path.relative_to(base_dir)}")
+            remove_pool_file(pool_path)
             removed += 1
 
     if removed == 0:
