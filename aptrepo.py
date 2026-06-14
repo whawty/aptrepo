@@ -172,11 +172,16 @@ def pool_prefix(source_name: str) -> str:
     return source_name[0]
 
 
+def pool_dir(base_dir: Path, dist: str, component: str) -> Path:
+    """Directory holding a dist+component's pool (parent of the prefix dirs)."""
+    return base_dir / "pool" / dist / component
+
+
 def pool_path(base_dir: Path, dist: str, component: str,
               source_name: str, filename: str) -> Path:
     """Absolute path for a .deb inside the pool."""
     prefix = pool_prefix(source_name)
-    return base_dir / "pool" / dist / component / prefix / source_name / filename
+    return pool_dir(base_dir, dist, component) / prefix / source_name / filename
 
 
 def dists_path(base_dir: Path, dist: str) -> Path:
@@ -318,12 +323,12 @@ def add_to_pool(base_dir: Path, dist: str, component: str,
 
 def scan_pool(base_dir: Path, dist: str, component: str) -> list[dict]:
     """Scan the pool for a given dist+component, return list of metadata dicts."""
-    pool_dir = base_dir / "pool" / dist / component
-    if not pool_dir.exists():
+    pdir = pool_dir(base_dir, dist, component)
+    if not pdir.exists():
         return []
 
     entries = []
-    for deb_path in sorted(pool_dir.rglob("*.deb")):
+    for deb_path in sorted(pdir.rglob("*.deb")):
         try:
             meta = read_deb(deb_path)
             meta["pool_path"] = deb_path
