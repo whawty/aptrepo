@@ -844,6 +844,18 @@ def write_repo_metadata(cfg: dict):
     print(f"  [meta] Written: repo.json")
 
 
+def _regenerate(cfg: dict, dist_names):
+    """Rebuild indices + Release for each unique dist, then write metadata once.
+
+    This is the common tail of every command that mutates the repo (add,
+    remove, update, ingest, prune): each affected dist is rebuilt and the
+    repo.json metadata is refreshed afterwards.
+    """
+    for dist_name in sorted(set(dist_names)):
+        update_dist(cfg, dist_name)
+    write_repo_metadata(cfg)
+
+
 # ---------------------------------------------------------------------------
 # configuration management
 # ---------------------------------------------------------------------------
@@ -933,6 +945,26 @@ def load_config(path: Path) -> dict:
     }
 
 
+def _require_dist(cfg: dict, dist_name: str) -> dict:
+    """Return the config for *dist_name*, or die if it is not configured."""
+    if dist_name not in cfg["dists"]:
+        die(f"Unknown dist '{dist_name}'. Known: {', '.join(cfg['dists'])}")
+    return cfg["dists"][dist_name]
+
+
+def _resolve_dists(cfg: dict, requested: list[str] | None) -> list[str]:
+    """Validate requested dist names, defaulting to all configured dists.
+
+    *requested* of None (or empty) means "all dists".  Dies on any name that
+    is not configured.
+    """
+    dists = list(requested) if requested else list(cfg["dists"])
+    for d in dists:
+        if d not in cfg["dists"]:
+            die(f"Unknown dist '{d}'. Known: {', '.join(cfg['dists'])}")
+    return dists
+
+
 # ---------------------------------------------------------------------------
 # command: init
 # ---------------------------------------------------------------------------
@@ -986,10 +1018,7 @@ def cmd_init(cfg: dict):
 def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
             component: str | None = None):
     """Add one or more .deb files to a dist."""
-    if dist_name not in cfg["dists"]:
-        die(f"Unknown dist '{dist_name}'. Known: {', '.join(cfg['dists'])}")
-
-    dist_cfg = cfg["dists"][dist_name]
+    dist_cfg = _require_dist(cfg, dist_name)
     base_dir = cfg["base_dir"]
 
     if component is None:
@@ -1022,8 +1051,7 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
         add_to_pool(base_dir, dist_name, component, meta, deb_path)
 
     # Regenerate indices for this dist
-    update_dist(cfg, dist_name)
-    write_repo_metadata(cfg)
+    _regenerate(cfg, [dist_name])
 
 
 # ---------------------------------------------------------------------------
@@ -1033,10 +1061,7 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
 def cmd_remove(cfg: dict, dist_name: str,
                package: str, version: str, arch: str | None):
     """Remove a package version from the pool and regenerate indices."""
-    if dist_name not in cfg["dists"]:
-        die(f"Unknown dist '{dist_name}'.")
-
-    dist_cfg = cfg["dists"][dist_name]
+    dist_cfg = _require_dist(cfg, dist_name)
     base_dir = cfg["base_dir"]
     removed = 0
 
@@ -1058,8 +1083,7 @@ def cmd_remove(cfg: dict, dist_name: str,
              (f" {arch}" if arch else ""))
     else:
         print(f"  Removed {removed} file(s).")
-        update_dist(cfg, dist_name)
-        write_repo_metadata(cfg)
+        _regenerate(cfg, [dist_name])
 
 
 # ---------------------------------------------------------------------------
@@ -1068,12 +1092,8 @@ def cmd_remove(cfg: dict, dist_name: str,
 
 def cmd_update(cfg: dict, dist_name: str | None):
     """Regenerate indices for one or all dists."""
-    dists = [dist_name] if dist_name else list(cfg["dists"])
-    for d in dists:
-        if d not in cfg["dists"]:
-            die(f"Unknown dist '{d}'.")
-        update_dist(cfg, d)
-    write_repo_metadata(cfg)
+    dists = _resolve_dists(cfg, [dist_name] if dist_name else None)
+    _regenerate(cfg, dists)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,27 +1304,12 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
             continue
 
     # Regenerate all affected dists once, after processing everything
-    for dist_name in sorted(dists_to_update):
-        update_dist(cfg, dist_name)
-    write_repo_metadata(cfg)
+    _regenerate(cfg, dists_to_update)
 
 
 # ---------------------------------------------------------------------------
 # command: prune
 # ---------------------------------------------------------------------------
-
-def _resolve_prune_dists(cfg: dict, dists: list[str] | None) -> list[str]:
-    """Validate requested dist names and return the list to prune.
-
-    Defaults to all configured dists.  Dies on an unknown dist name.
-    """
-    target_dists = []
-    for d in (dists or list(cfg["dists"])):
-        if d not in cfg["dists"]:
-            die(f"Unknown dist '{d}'.")
-        target_dists.append(d)
-    return target_dists
-
 
 def _group_pool_versions(base_dir: Path, dist_name: str, component: str,
                          packages: list[str] | None
@@ -1363,7 +1368,7 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
         die("--keep must be at least 1.")
 
     base_dir = cfg["base_dir"]
-    target_dists = _resolve_prune_dists(cfg, dists)
+    target_dists = _resolve_dists(cfg, dists)
 
     mode = "[DRY RUN] " if dry_run else ""
     print(f"{mode}Pruning: keep {keep} version(s) per package per arch")
@@ -1415,9 +1420,7 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
               f"Re-run without --dry-run to apply.")
     else:
         print(f"\nRemoved {total_removed} package file(s).")
-        for dist_name in sorted(dists_to_update):
-            update_dist(cfg, dist_name)
-        write_repo_metadata(cfg)
+        _regenerate(cfg, dists_to_update)
 
 
 # ---------------------------------------------------------------------------
