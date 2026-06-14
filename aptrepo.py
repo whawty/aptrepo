@@ -261,52 +261,6 @@ def read_deb(deb_path: Path) -> dict:
 
 
 # ---------------------------------------------
-# Packages index building
-
-def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
-    """Produce one stanza for a Packages index file."""
-    ctrl_text = meta["ctrl_text"]
-
-    # Parse a fresh TagSection from the stored control text.
-    section = apt_pkg.TagSection(ctrl_text)
-
-    rewrites = [
-        apt_pkg.TagRewrite("Filename", filename_rel),
-        apt_pkg.TagRewrite("Size", str(meta["size"])),
-    ]
-    for field, value in meta["hashes"].items():
-        rewrites.append(apt_pkg.TagRewrite(field, value))
-
-    # Strip any pre-existing hash/size/filename fields from the control data
-    for field in _STRIP_FIELDS:
-        if field in section:
-            rewrites.append(apt_pkg.TagRemove(field))
-
-    with tempfile.TemporaryFile() as f:
-        section.write(f, REWRITE_ORDER, rewrites)
-        f.seek(0)
-        return f.read()
-
-
-def write_packages_index(entries: list[bytes], dest_dir: Path):
-    """Write Packages, Packages.gz, Packages.xz to dest_dir."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    raw = b"\n".join(entries) + b"\n"
-
-    buf_io = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf_io, mode="wb", mtime=0) as g:
-        g.write(raw)
-    gz_data = buf_io.getvalue()
-
-    xz_data = lzma.compress(raw, format=lzma.FORMAT_XZ)
-
-    atomic_write(dest_dir / "Packages", raw)
-    atomic_write(dest_dir / "Packages.gz", gz_data)
-    atomic_write(dest_dir / "Packages.xz", xz_data)
-
-
-# ---------------------------------------------
 # Pool management
 
 def add_to_pool(base_dir: Path, dist: str, component: str,
@@ -365,6 +319,52 @@ def remove_pool_file(pool_path: Path):
             parent.rmdir()
         except OSError:
             break
+
+
+# ---------------------------------------------
+# Packages index building
+
+def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
+    """Produce one stanza for a Packages index file."""
+    ctrl_text = meta["ctrl_text"]
+
+    # Parse a fresh TagSection from the stored control text.
+    section = apt_pkg.TagSection(ctrl_text)
+
+    rewrites = [
+        apt_pkg.TagRewrite("Filename", filename_rel),
+        apt_pkg.TagRewrite("Size", str(meta["size"])),
+    ]
+    for field, value in meta["hashes"].items():
+        rewrites.append(apt_pkg.TagRewrite(field, value))
+
+    # Strip any pre-existing hash/size/filename fields from the control data
+    for field in _STRIP_FIELDS:
+        if field in section:
+            rewrites.append(apt_pkg.TagRemove(field))
+
+    with tempfile.TemporaryFile() as f:
+        section.write(f, REWRITE_ORDER, rewrites)
+        f.seek(0)
+        return f.read()
+
+
+def write_packages_index(entries: list[bytes], dest_dir: Path):
+    """Write Packages, Packages.gz, Packages.xz to dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    raw = b"\n".join(entries) + b"\n"
+
+    buf_io = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf_io, mode="wb", mtime=0) as g:
+        g.write(raw)
+    gz_data = buf_io.getvalue()
+
+    xz_data = lzma.compress(raw, format=lzma.FORMAT_XZ)
+
+    atomic_write(dest_dir / "Packages", raw)
+    atomic_write(dest_dir / "Packages.gz", gz_data)
+    atomic_write(dest_dir / "Packages.xz", xz_data)
 
 
 # ---------------------------------------------
@@ -455,6 +455,7 @@ def run_gpg(cmd: list):
             + result.stderr.decode(errors="replace")
         )
 
+
 def _gpg_sign(release_path: Path, dest: Path, key_id: str, sign_flag: str):
     """Sign *release_path* with gpg, writing the signature atomically to *dest*.
 
@@ -486,68 +487,6 @@ def sign_release(release_path: Path, key_id: str):
     base = release_path.parent
     _gpg_sign(release_path, base / "Release.gpg", key_id, "--detach-sign")
     _gpg_sign(release_path, base / "InRelease", key_id, "--clearsign")
-
-
-# ---------------------------------------------
-# update dist
-
-def _entry_sort_key(entry: bytes) -> tuple:
-    """Sort key for Packages entries: (package_name, version)."""
-    try:
-        section = apt_pkg.TagSection(entry.decode("utf-8", errors="replace"))
-        return (section.get("Package", ""), section.get("Version", ""))
-    except Exception:
-        return ("", "")
-
-
-def update_dist(cfg: dict, dist_name: str):
-    """Regenerate Packages indices and Release file for one dist."""
-    dist_cfg = cfg["dists"][dist_name]
-    base_dir = cfg["base_dir"]
-
-    print(f"\nUpdating dist: {dist_name}")
-
-    for component in dist_cfg["components"]:
-        entries_by_arch: dict[str, list[bytes]] = {
-            arch: [] for arch in dist_cfg["architectures"]
-        }
-
-        pool_entries = scan_pool(base_dir, dist_name, component)
-        for meta in pool_entries:
-            deb_path = meta["pool_path"]
-            # Relative filename from repo root for the Packages index
-            filename_rel = str(deb_path.relative_to(base_dir))
-
-            entry_bytes = build_packages_entry(meta, filename_rel)
-
-            target_arches = (
-                dist_cfg["architectures"]
-                if meta["arch"] == "all"
-                else [meta["arch"]]
-            )
-            for arch in target_arches:
-                if arch in entries_by_arch:
-                    entries_by_arch[arch].append(entry_bytes)
-
-        for arch, entries in entries_by_arch.items():
-            # Sort entries by package name then version for deterministic output
-            entries.sort(key=_entry_sort_key)
-            pkg_dir = packages_path(base_dir, dist_name, component, arch)
-            write_packages_index(entries, pkg_dir)
-            print(f"  [index] {component}/binary-{arch}: {len(entries)} package(s)")
-
-    release_path = build_release(base_dir, dist_cfg)
-
-    key_id = dist_cfg.get("sign_with")
-    if key_id:
-        sign_release(release_path, key_id)
-    else:
-        # Remove stale signature files if signing is disabled
-        for fname in ("Release.gpg", "InRelease"):
-            stale = release_path.parent / fname
-            if stale.exists():
-                stale.unlink()
-        print("  [sign] Skipped (no sign_with configured)")
 
 
 # ---------------------------------------------
@@ -834,6 +773,65 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
 
 # ---------------------------------------------
 # Repo metadata
+
+def _entry_sort_key(entry: bytes) -> tuple:
+    """Sort key for Packages entries: (package_name, version)."""
+    try:
+        section = apt_pkg.TagSection(entry.decode("utf-8", errors="replace"))
+        return (section.get("Package", ""), section.get("Version", ""))
+    except Exception:
+        return ("", "")
+
+
+def update_dist(cfg: dict, dist_name: str):
+    """Regenerate Packages indices and Release file for one dist."""
+    dist_cfg = cfg["dists"][dist_name]
+    base_dir = cfg["base_dir"]
+
+    print(f"\nUpdating dist: {dist_name}")
+
+    for component in dist_cfg["components"]:
+        entries_by_arch: dict[str, list[bytes]] = {
+            arch: [] for arch in dist_cfg["architectures"]
+        }
+
+        pool_entries = scan_pool(base_dir, dist_name, component)
+        for meta in pool_entries:
+            deb_path = meta["pool_path"]
+            # Relative filename from repo root for the Packages index
+            filename_rel = str(deb_path.relative_to(base_dir))
+
+            entry_bytes = build_packages_entry(meta, filename_rel)
+
+            target_arches = (
+                dist_cfg["architectures"]
+                if meta["arch"] == "all"
+                else [meta["arch"]]
+            )
+            for arch in target_arches:
+                if arch in entries_by_arch:
+                    entries_by_arch[arch].append(entry_bytes)
+
+        for arch, entries in entries_by_arch.items():
+            # Sort entries by package name then version for deterministic output
+            entries.sort(key=_entry_sort_key)
+            pkg_dir = packages_path(base_dir, dist_name, component, arch)
+            write_packages_index(entries, pkg_dir)
+            print(f"  [index] {component}/binary-{arch}: {len(entries)} package(s)")
+
+    release_path = build_release(base_dir, dist_cfg)
+
+    key_id = dist_cfg.get("sign_with")
+    if key_id:
+        sign_release(release_path, key_id)
+    else:
+        # Remove stale signature files if signing is disabled
+        for fname in ("Release.gpg", "InRelease"):
+            stale = release_path.parent / fname
+            if stale.exists():
+                stale.unlink()
+        print("  [sign] Skipped (no sign_with configured)")
+
 
 def build_repo_json(cfg: dict) -> dict:
     """Build the repo.json structure from the loaded config."""
