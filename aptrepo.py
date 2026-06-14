@@ -1352,6 +1352,40 @@ def _select_versions_to_remove(versions: list[tuple[str, Path]], keep: int
     return sorted_versions[:keep], sorted_versions[keep:]
 
 
+def _prune_component(dist_name: str, component: str, base_dir: Path,
+                     packages: list[str] | None, keep: int,
+                     dry_run: bool) -> tuple[int, bool]:
+    """Prune one (dist, component): report and (unless dry-run) delete old
+    versions, keeping the newest *keep* per (package, arch).
+
+    Returns (number_of_files_removed, whether_anything_was_deleted).
+    """
+    removed = 0
+    deleted = False
+    groups = _group_pool_versions(base_dir, dist_name, component, packages)
+
+    for (pkg, arch), versions in sorted(groups.items()):
+        if len(versions) <= keep:
+            continue  # nothing to prune here
+
+        to_keep, to_remove = _select_versions_to_remove(versions, keep)
+
+        print(
+            f"  {dist_name}/{component}  {pkg} [{arch}]:\n"
+            f"    keep:   {', '.join(v for v, _ in to_keep)}\n"
+            f"    remove: {', '.join(v for v, _ in to_remove)}"
+        )
+
+        if not dry_run:
+            for _ver, pool_path in to_remove:
+                remove_pool_file(pool_path)
+            deleted = True
+
+        removed += len(to_remove)
+
+    return removed, deleted
+
+
 def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
               components: list[str] | None, packages: list[str] | None,
               dry_run: bool):
@@ -1389,32 +1423,14 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
 
     for dist_name in target_dists:
         dist_cfg = cfg["dists"][dist_name]
-        target_components = [
-            c for c in dist_cfg["components"]
-            if components is None or c in components
-        ]
+        target_components = [c for c in dist_cfg["components"] if components is None or c in components]
 
         for component in target_components:
-            groups = _group_pool_versions(base_dir, dist_name, component, packages)
-
-            for (pkg, arch), versions in sorted(groups.items()):
-                if len(versions) <= keep:
-                    continue  # nothing to prune here
-
-                to_keep, to_remove = _select_versions_to_remove(versions, keep)
-
-                print(
-                    f"  {dist_name}/{component}  {pkg} [{arch}]:\n"
-                    f"    keep:   {', '.join(v for v, _ in to_keep)}\n"
-                    f"    remove: {', '.join(v for v, _ in to_remove)}"
-                )
-
-                if not dry_run:
-                    for _ver, pool_path in to_remove:
-                        remove_pool_file(pool_path)
-                    dists_to_update.add(dist_name)
-
-                total_removed += len(to_remove)
+            removed, deleted = _prune_component(
+                dist_name, component, base_dir, packages, keep, dry_run)
+            total_removed += removed
+            if deleted:
+                dists_to_update.add(dist_name)
 
     if total_removed == 0:
         print("  Nothing to prune.")
