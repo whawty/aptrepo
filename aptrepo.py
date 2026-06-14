@@ -478,6 +478,15 @@ def sign_release(release_path: Path, key_id: str):
 # ---------------------------------------------
 # update dist
 
+def _entry_sort_key(entry: bytes) -> tuple:
+    """Sort key for Packages entries: (package_name, version)."""
+    try:
+        section = apt_pkg.TagSection(entry.decode("utf-8", errors="replace"))
+        return (section.get("Package", ""), section.get("Version", ""))
+    except Exception:
+        return ("", "")
+
+
 def update_dist(cfg: dict, dist_name: str):
     """Regenerate Packages indices and Release file for one dist."""
     dist_cfg = cfg["dists"][dist_name]
@@ -526,15 +535,6 @@ def update_dist(cfg: dict, dist_name: str):
             if stale.exists():
                 stale.unlink()
         print("  [sign] Skipped (no sign_with configured)")
-
-
-def _entry_sort_key(entry: bytes) -> tuple:
-    """Sort key for Packages entries: (package_name, version)."""
-    try:
-        section = apt_pkg.TagSection(entry.decode("utf-8", errors="replace"))
-        return (section.get("Package", ""), section.get("Version", ""))
-    except Exception:
-        return ("", "")
 
 
 # ---------------------------------------------
