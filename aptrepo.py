@@ -351,8 +351,6 @@ def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
 
 def write_packages_index(entries: list[bytes], dest_dir: Path):
     """Write Packages, Packages.gz, Packages.xz to dest_dir."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
     raw = b"\n".join(entries) + b"\n"
 
     buf_io = io.BytesIO()
@@ -438,7 +436,6 @@ def build_release(base_dir: Path, dist_cfg: dict):
     lines.extend(sha512_lines)
 
     release_path = dist_dir / "Release"
-    dist_dir.mkdir(parents=True, exist_ok=True)
     atomic_write(release_path, ("\n".join(lines) + "\n").encode())
     print(f"  [release] Written: {release_path.relative_to(base_dir)}")
     return release_path
@@ -852,8 +849,6 @@ def write_repo_metadata(cfg: dict):
     and is consumed by the static browser index (index.html) served by nginx.
     """
     base_dir = cfg["base_dir"]
-    base_dir.mkdir(parents=True, exist_ok=True)
-
     repo_json_path = base_dir / "repo.json"
     repo_data = build_repo_json(cfg)
     atomic_write(repo_json_path, (json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n").encode())
