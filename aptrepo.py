@@ -756,6 +756,13 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
                     f"expected {entry['md5']}, got {actual_md5}"
                 )
                 continue
+        else:
+            # No checksum at all: we cannot confirm the file matches the
+            # (signed) manifest, so refuse it rather than trust it blindly.
+            errors.append(
+                f"  No SHA256 or MD5 checksum listed for {fname} in .changes"
+            )
+            continue
 
         verified.append(deb_path)
 
