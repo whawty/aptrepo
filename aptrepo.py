@@ -2,14 +2,26 @@
 """
 aptrepo.py - Private APT repository manager
 
+A small, self-contained manager for private APT repositories.  It combines
+ideas from reprepro (Debian-style pool/dists layout and signed .changes
+ingestion) and freight (per-dist pools), while additionally allowing several
+versions of the same package to coexist within a single dist.
+
 Features:
   - Multiple versions of the same package per dist
-  - Per-dist pool directories (like freight)
-  - Debian-style pool layout: pool/<dist>/<component>/<prefix>/<source>/
-  - Multiple dists, components, architectures per repo
-  - YAML config with defaults + per-dist overrides
-  - GPG signing via gpg agent
-  - Static browsable HTML index with live Packages parsing
+  - Per-dist pool layout: pool/<dist>/<component>/<prefix>/<source>/, so the
+    same package+version can differ between dists
+  - Multiple dists, components, and architectures per repo
+  - YAML config with shared defaults + per-dist overrides
+  - Suite symlinks created automatically (e.g. dists/stable -> bookworm)
+  - Release signing via gpg, working with gpg-agent (including SSH-forwarded
+    keys); produces both detached (Release.gpg) and inline (InRelease)
+    signatures
+  - Signed .changes ingestion with signature verification via Sequoia-PGP
+    (pysequoia), authorised per dist through an allowed_signers list
+  - Pruning of old versions, keeping the newest N per package and architecture
+    using Debian version ordering
+  - Static, browsable HTML index that parses the Packages files in-browser
 
 Usage:
   aptrepo.py init
@@ -18,7 +30,8 @@ Usage:
   aptrepo.py update           [<dist>]
   aptrepo.py list             [<dist>]
   aptrepo.py ingest           [<incoming_dir>]
-  aptrepo.py prune            <n> [options]
+  aptrepo.py prune            <n> [-d <dist>]... [-C <component>]...
+                              [-p <package>]... [--dry-run]
 """
 
 import argparse
