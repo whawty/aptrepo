@@ -73,7 +73,7 @@ def warn(msg: str):
     print(f"WARNING: {msg}", file=sys.stderr)
 
 
-def _is_safe_basename(name: str) -> bool:
+def is_safe_basename(name: str) -> bool:
     """True if *name* is a plain filename (no path separators, no traversal)."""
     if not name or name in (".", ".."):
         return False
@@ -103,7 +103,7 @@ def validate_deb_identifiers(package: str, source: str,
         raise ValueError(f"Invalid architecture: {arch!r}")
 
 
-def _file_sha256(path: Path) -> str | None:
+def file_sha256(path: Path) -> str | None:
     """Return the SHA256 hex digest of *path*, or None if unavailable."""
     with open(path, "rb") as f:
         hashes = apt_pkg.Hashes(f)
@@ -113,7 +113,7 @@ def _file_sha256(path: Path) -> str | None:
     )
 
 
-def _move_to(src: Path, dest_dir: Path):
+def move_to(src: Path, dest_dir: Path):
     """Move a file to dest_dir, appending a timestamp if name already exists."""
     dest = dest_dir / src.name
     if dest.exists():
@@ -122,7 +122,7 @@ def _move_to(src: Path, dest_dir: Path):
     shutil.move(str(src), dest)
 
 
-def _atomic_replace(tmp: str, dest: Path):
+def atomic_replace(tmp: str, dest: Path):
     """Set the correct mode on *tmp*, then atomically rename it onto *dest*.
 
     tempfile.mkstemp() always creates files as 0600, and os.replace() keeps
@@ -139,7 +139,7 @@ def _atomic_replace(tmp: str, dest: Path):
     os.replace(tmp, dest)
 
 
-def _atomic_write(dest: Path, data: bytes):
+def atomic_write(dest: Path, data: bytes):
     """Write *data* to *dest* atomically using a tempfile + rename."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
@@ -148,7 +148,7 @@ def _atomic_write(dest: Path, data: bytes):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        _atomic_replace(tmp, dest)
+        atomic_replace(tmp, dest)
     except Exception:
         try:
             os.unlink(tmp)
@@ -288,9 +288,9 @@ def write_packages_index(entries: list[bytes], dest_dir: Path):
 
     xz_data = lzma.compress(raw, format=lzma.FORMAT_XZ)
 
-    _atomic_write(dest_dir / "Packages", raw)
-    _atomic_write(dest_dir / "Packages.gz", gz_data)
-    _atomic_write(dest_dir / "Packages.xz", xz_data)
+    atomic_write(dest_dir / "Packages", raw)
+    atomic_write(dest_dir / "Packages.gz", gz_data)
+    atomic_write(dest_dir / "Packages.xz", xz_data)
 
 
 # ---------------------------------------------
@@ -303,7 +303,7 @@ def add_to_pool(base_dir: Path, dist: str, component: str,
                      meta["source"], src_path.name)
     if dest.exists():
         # Check if it's identical by SHA256
-        existing_sha256 = _file_sha256(dest)
+        existing_sha256 = file_sha256(dest)
         if existing_sha256 == meta["hashes"].get("SHA256"):
             print(f"  [pool] Already present (identical): {dest.relative_to(base_dir)}")
             return dest
@@ -357,7 +357,7 @@ def remove_pool_file(pool_path: Path):
 # ---------------------------------------------
 # Release file generation
 
-def _hash_file(path: Path) -> dict:
+def hash_file(path: Path) -> dict:
     with open(path, "rb") as f:
         hashes = apt_pkg.Hashes(f)
     result = {"size": os.path.getsize(path)}
@@ -395,7 +395,7 @@ def build_release(base_dir: Path, dist_cfg: dict):
     sha512_lines = []
     for fpath in index_files:
         rel = fpath.relative_to(dist_dir)
-        info = _hash_file(fpath)
+        info = hash_file(fpath)
         size = info["size"]
         md5_lines.append(f" {info['md5']} {size:>16} {rel}")
         sha1_lines.append(f" {info['sha1']} {size:>16} {rel}")
@@ -426,7 +426,7 @@ def build_release(base_dir: Path, dist_cfg: dict):
 
     release_path = dist_dir / "Release"
     dist_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write(release_path, ("\n".join(lines) + "\n").encode())
+    atomic_write(release_path, ("\n".join(lines) + "\n").encode())
     print(f"  [release] Written: {release_path.relative_to(base_dir)}")
     return release_path
 
@@ -434,7 +434,7 @@ def build_release(base_dir: Path, dist_cfg: dict):
 # ---------------------------------------------
 # GPG signing
 
-def _run_gpg(cmd: list):
+def run_gpg(cmd: list):
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         die(
@@ -457,8 +457,8 @@ def _gpg_sign(release_path: Path, dest: Path, key_id: str, sign_flag: str):
         if key_id:
             cmd += ["--local-user", key_id]
         cmd += ["--output", tmp, str(release_path)]
-        _run_gpg(cmd)
-        _atomic_replace(tmp, dest)
+        run_gpg(cmd)
+        atomic_replace(tmp, dest)
     except Exception:
         try:
             os.unlink(tmp)
@@ -540,7 +540,7 @@ def _entry_sort_key(entry: bytes) -> tuple:
 # ---------------------------------------------
 # Signature verification (Sequoia-PGP via the pysequoia bindings)
 
-def _import_pysequoia():
+def import_pysequoia():
     """Import pysequoia lazily so commands that don't verify signatures
     (init, add, remove, update, list, prune) work without the dependency.
 
@@ -565,7 +565,7 @@ def load_signer_certs(keyring: Path) -> list:
     *keyring* may be a single file (possibly containing several certs) or a
     directory of cert files.  Returns a list of pysequoia Cert objects.
     """
-    Cert, _ = _import_pysequoia()
+    Cert, _ = import_pysequoia()
 
     if not keyring.exists():
         die(f"signer_keyring path does not exist: {keyring}")
@@ -609,7 +609,7 @@ def verify_changes_signature(changes_path: Path, certs: list) -> tuple[list[str]
     here -- the caller checks the returned fingerprints against the dist's
     allowed_signers after parsing the verified payload.
     """
-    _, verify = _import_pysequoia()
+    _, verify = import_pysequoia()
 
     raw = changes_path.read_bytes()
 
@@ -641,7 +641,7 @@ def verify_changes_signature(changes_path: Path, certs: list) -> tuple[list[str]
     return valid_fingerprints, result.bytes
 
 
-def _normalise_keyid(keyid: str) -> str:
+def normalise_keyid(keyid: str) -> str:
     """Strip a leading 0x/0X prefix and uppercase the key id."""
     k = keyid.strip()
     if k[:2].lower() == "0x":
@@ -649,7 +649,7 @@ def _normalise_keyid(keyid: str) -> str:
     return k.upper()
 
 
-def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
+def fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
     """Return True if *fingerprint* matches any entry in *allowed_keyids*.
 
     Fingerprint is a full 40-char hex string (from VALIDSIG).
@@ -662,7 +662,7 @@ def _fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
     """
     fp = fingerprint.strip().upper()
     for kid in allowed_keyids:
-        kid_norm = _normalise_keyid(kid)
+        kid_norm = normalise_keyid(kid)
         if not kid_norm:
             continue
         if fp.endswith(kid_norm):
@@ -736,7 +736,7 @@ def parse_changes(payload: bytes) -> dict:
             continue
         # Defence in depth: filenames from the .changes are used to locate
         # files on disk, so reject anything that is not a plain basename.
-        if not _is_safe_basename(fname):
+        if not is_safe_basename(fname):
             raise ValueError(f"Unsafe filename in .changes: {fname!r}")
         raw_section = files_map.get(fname, {}).get("section", "")
         if "/" in raw_section:
@@ -791,7 +791,7 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
 
         # Verify SHA256 if present (preferred), fall back to MD5
         if entry.get("sha256"):
-            actual_sha256 = _file_sha256(deb_path)
+            actual_sha256 = file_sha256(deb_path)
             if actual_sha256 != entry["sha256"]:
                 errors.append(
                     f"  SHA256 mismatch for {fname}: "
@@ -845,11 +845,11 @@ def write_repo_metadata(cfg: dict):
 
     repo_json_path = base_dir / "repo.json"
     repo_data = build_repo_json(cfg)
-    _atomic_write(repo_json_path, (json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n").encode())
+    atomic_write(repo_json_path, (json.dumps(repo_data, indent=2, ensure_ascii=False) + "\n").encode())
     print(f"  [meta] Written: repo.json")
 
 
-def _regenerate(cfg: dict, dist_names):
+def regenerate(cfg: dict, dist_names):
     """Rebuild indices + Release for each unique dist, then write metadata once.
 
     This is the common tail of every command that mutates the repo (add,
@@ -950,14 +950,14 @@ def load_config(path: Path) -> dict:
     }
 
 
-def _require_dist(cfg: dict, dist_name: str) -> dict:
+def require_dist(cfg: dict, dist_name: str) -> dict:
     """Return the config for *dist_name*, or die if it is not configured."""
     if dist_name not in cfg["dists"]:
         die(f"Unknown dist '{dist_name}'. Known: {', '.join(cfg['dists'])}")
     return cfg["dists"][dist_name]
 
 
-def _resolve_dists(cfg: dict, requested: list[str] | None) -> list[str]:
+def resolve_dists(cfg: dict, requested: list[str] | None) -> list[str]:
     """Validate requested dist names, defaulting to all configured dists.
 
     *requested* of None (or empty) means "all dists".  Dies on any name that
@@ -1023,7 +1023,7 @@ def cmd_init(cfg: dict):
 def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
             component: str | None = None):
     """Add one or more .deb files to a dist."""
-    dist_cfg = _require_dist(cfg, dist_name)
+    dist_cfg = require_dist(cfg, dist_name)
     base_dir = cfg["base_dir"]
 
     if component is None:
@@ -1056,7 +1056,7 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
         add_to_pool(base_dir, dist_name, component, meta, deb_path)
 
     # Regenerate indices for this dist
-    _regenerate(cfg, [dist_name])
+    regenerate(cfg, [dist_name])
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1066,7 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
 def cmd_remove(cfg: dict, dist_name: str,
                package: str, version: str, arch: str | None):
     """Remove a package version from the pool and regenerate indices."""
-    dist_cfg = _require_dist(cfg, dist_name)
+    dist_cfg = require_dist(cfg, dist_name)
     base_dir = cfg["base_dir"]
     removed = 0
 
@@ -1088,7 +1088,7 @@ def cmd_remove(cfg: dict, dist_name: str,
              (f" {arch}" if arch else ""))
     else:
         print(f"  Removed {removed} file(s).")
-        _regenerate(cfg, [dist_name])
+        regenerate(cfg, [dist_name])
 
 
 # ---------------------------------------------------------------------------
@@ -1097,8 +1097,8 @@ def cmd_remove(cfg: dict, dist_name: str,
 
 def cmd_update(cfg: dict, dist_name: str | None):
     """Regenerate indices for one or all dists."""
-    dists = _resolve_dists(cfg, [dist_name] if dist_name else None)
-    _regenerate(cfg, dists)
+    dists = resolve_dists(cfg, [dist_name] if dist_name else None)
+    regenerate(cfg, dists)
 
 
 # ---------------------------------------------------------------------------
@@ -1159,13 +1159,13 @@ def _authorise_signer(dist_name: str, dist_cfg: dict,
             f"Add at least one key fingerprint to accept uploads."
         )
     for kid in allowed_signers:
-        if len(_normalise_keyid(kid)) == 8:
+        if len(normalise_keyid(kid)) == 8:
             warn(
                 f"Short key ID '{kid}' in allowed_signers is insecure. "
                 f"Use the full 40-char fingerprint."
             )
 
-    matched = next((fp for fp in valid_fingerprints if _fingerprint_matches(fp, allowed_signers)), None)
+    matched = next((fp for fp in valid_fingerprints if fingerprint_matches(fp, allowed_signers)), None)
     if matched is None:
         raise ValueError(
             f"Valid signature(s) from {', '.join(valid_fingerprints)} but none "
@@ -1251,9 +1251,9 @@ def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
     _add_changes_to_pool(cfg, dist_name, dist_cfg, changes_info, verified_paths)
     dists_to_update.add(dist_name)
 
-    _move_to(changes_path, incoming_dir / "done")
+    move_to(changes_path, incoming_dir / "done")
     for deb_path in verified_paths:
-        _move_to(deb_path, incoming_dir / "done")
+        move_to(deb_path, incoming_dir / "done")
     print(f"  [OK] Moved to done/")
 
 
@@ -1305,11 +1305,11 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None):
             # Move the .changes to failed/.  Referenced .deb files are left in
             # place: a parse/verify failure means we cannot reliably attribute
             # them, and they may be shared with another .changes.
-            _move_to(changes_path, failed_dir)
+            move_to(changes_path, failed_dir)
             continue
 
     # Regenerate all affected dists once, after processing everything
-    _regenerate(cfg, dists_to_update)
+    regenerate(cfg, dists_to_update)
 
 
 # ---------------------------------------------------------------------------
@@ -1407,7 +1407,7 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
         die("--keep must be at least 1.")
 
     base_dir = cfg["base_dir"]
-    target_dists = _resolve_dists(cfg, dists)
+    target_dists = resolve_dists(cfg, dists)
 
     mode = "[DRY RUN] " if dry_run else ""
     print(f"{mode}Pruning: keep {keep} version(s) per package per arch")
@@ -1441,7 +1441,7 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
               f"Re-run without --dry-run to apply.")
     else:
         print(f"\nRemoved {total_removed} package file(s).")
-        _regenerate(cfg, dists_to_update)
+        regenerate(cfg, dists_to_update)
 
 
 # ---------------------------------------------------------------------------
