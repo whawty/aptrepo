@@ -234,7 +234,7 @@ def read_deb(deb_path: Path) -> dict:
     with open(deb_path, "rb") as f:
         hashes = apt_pkg.Hashes(f)
 
-    hash_map = {}
+    hash_map: dict[str, str] = {}
     size = None
     for hs in hashes.hashes:
         if hs.hashtype == "MD5Sum":
@@ -296,7 +296,7 @@ def scan_pool(base_dir: Path, dist: str, component: str) -> list[dict]:
     if not pdir.exists():
         return []
 
-    entries = []
+    entries: list[dict] = []
     for deb_path in sorted(pdir.rglob("*.deb")):
         try:
             meta = read_deb(deb_path)
@@ -392,7 +392,7 @@ def build_release(base_dir: Path, dist_cfg: dict) -> Path:
     dist_dir = dists_path(base_dir, dist)
 
     # Collect all index files we need to hash
-    index_files = []
+    index_files: list[Path] = []
     for component in dist_cfg["components"]:
         for arch in dist_cfg["architectures"]:
             pkg_dir = dist_dir / component / f"binary-{arch}"
@@ -402,10 +402,10 @@ def build_release(base_dir: Path, dist_cfg: dict) -> Path:
                     index_files.append(fpath)
 
     # Build hash sections
-    md5_lines = []
-    sha1_lines = []
-    sha256_lines = []
-    sha512_lines = []
+    md5_lines: list[str] = []
+    sha1_lines: list[str] = []
+    sha256_lines: list[str] = []
+    sha512_lines: list[str] = []
     for fpath in index_files:
         rel = fpath.relative_to(dist_dir)
         info = hash_file(fpath)
@@ -418,7 +418,7 @@ def build_release(base_dir: Path, dist_cfg: dict) -> Path:
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%a, %d %b %Y %H:%M:%S +0000")
 
-    lines = []
+    lines: list[str] = []
     lines.append(f"Origin: {dist_cfg.get('origin') or dist}")
     lines.append(f"Label: {dist_cfg.get('label') or dist}")
     lines.append(f"Suite: {dist_cfg.get('suite') or dist}")
@@ -521,7 +521,7 @@ def load_signer_certs(keyring: Path) -> list:
     if not keyring.exists():
         die(f"signer_keyring path does not exist: {keyring}")
 
-    files = []
+    files: list[Path] = []
     if keyring.is_dir():
         files = [p for p in sorted(keyring.iterdir()) if p.is_file()]
     else:
@@ -626,7 +626,7 @@ def fingerprint_matches(fingerprint: str, allowed_keyids: list[str]) -> bool:
 
 def _parse_hash_field(field_value: str) -> dict[str, dict]:
     """Parse a multi-line Checksums-* or Files field into {filename: {hash/size}}."""
-    result = {}
+    result: dict[str, dict] = {}
     for line in field_value.strip().splitlines():
         parts = line.split()
         if len(parts) == 3:
@@ -680,7 +680,7 @@ def parse_changes(payload: bytes) -> dict:
     # Fall back to Checksums-Sha256 keys if Files is absent
     all_filenames = set(files_map) | set(sha256_map)
 
-    files = []
+    files: list[dict] = []
     for fname in sorted(all_filenames):
         if not fname.endswith(".deb"):
             # Skip .dsc, .tar.*, .buildinfo etc.
@@ -721,8 +721,8 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
     Returns the list of verified .deb Paths.
     Raises ValueError listing all problems found (checks everything before raising).
     """
-    errors = []
-    verified = []
+    errors: list[str] = []
+    verified: list[Path] = []
 
     for entry in changes_info["files"]:
         fname = entry["filename"]
@@ -841,7 +841,7 @@ def update_dist(cfg: dict, dist_name: str) -> None:
 
 def build_repo_json(cfg: dict) -> dict:
     """Build the repo.json structure from the loaded config."""
-    dists_out = {}
+    dists_out: dict[str, dict] = {}
     for name, dist_cfg in cfg["dists"].items():
         dists_out[name] = {
             "components":    dist_cfg["components"],
@@ -1135,7 +1135,7 @@ def cmd_list(cfg: dict, dist_name: str | None) -> None:
               f"{', '.join(dist_cfg['architectures'])})")
         print(f"{'='*60}")
 
-        all_entries = []
+        all_entries: list[tuple[str, dict]] = []
         for component in dist_cfg["components"]:
             for meta in scan_pool(base_dir, dist_name, component):
                 all_entries.append((component, meta))
