@@ -47,8 +47,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NoReturn
 
 import apt_inst
 import apt_pkg
@@ -77,12 +79,12 @@ _ARCH_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")            # amd64, arm64, all, .
 # Utilities
 # ---------------------------------------------------------------------------
 
-def die(msg: str):
+def die(msg: str) -> NoReturn:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
-def warn(msg: str):
+def warn(msg: str) -> None:
     print(f"WARNING: {msg}", file=sys.stderr)
 
 
@@ -98,7 +100,7 @@ def is_safe_basename(name: str) -> bool:
 
 
 def validate_deb_identifiers(package: str, source: str,
-                             version: str, arch: str):
+                             version: str, arch: str) -> None:
     """Validate identifiers extracted from a .deb control file.
 
     These values are used to build filesystem paths and repository index
@@ -126,7 +128,7 @@ def file_sha256(path: Path) -> str | None:
     )
 
 
-def move_to(src: Path, dest_dir: Path):
+def move_to(src: Path, dest_dir: Path) -> None:
     """Move a file to dest_dir, appending a timestamp if name already exists."""
     dest = dest_dir / src.name
     if dest.exists():
@@ -135,7 +137,7 @@ def move_to(src: Path, dest_dir: Path):
     shutil.move(str(src), dest)
 
 
-def atomic_replace(tmp: str, dest: Path):
+def atomic_replace(tmp: str, dest: Path) -> None:
     """Set the correct mode on *tmp*, then atomically rename it onto *dest*.
 
     tempfile.mkstemp() always creates files as 0600, and os.replace() keeps
@@ -152,7 +154,7 @@ def atomic_replace(tmp: str, dest: Path):
     os.replace(tmp, dest)
 
 
-def atomic_write(dest: Path, data: bytes):
+def atomic_write(dest: Path, data: bytes) -> None:
     """Write *data* to *dest* atomically using a tempfile + rename."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
@@ -305,7 +307,7 @@ def scan_pool(base_dir: Path, dist: str, component: str) -> list[dict]:
     return entries
 
 
-def remove_pool_file(pool_path: Path):
+def remove_pool_file(pool_path: Path) -> None:
     """Remove a single .deb from the pool and tidy up emptied directories.
 
     Walks up the pool/<dist>/<component>/<prefix>/<source>/ layout removing the
@@ -349,7 +351,7 @@ def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
         return f.read()
 
 
-def write_packages_index(entries: list[bytes], dest_dir: Path):
+def write_packages_index(entries: list[bytes], dest_dir: Path) -> None:
     """Write Packages, Packages.gz, Packages.xz to dest_dir."""
     raw = b"\n".join(entries) + b"\n"
 
@@ -384,7 +386,7 @@ def hash_file(path: Path) -> dict:
     return result
 
 
-def build_release(base_dir: Path, dist_cfg: dict):
+def build_release(base_dir: Path, dist_cfg: dict) -> Path:
     """Write the Release file for a dist, collecting hashes of all index files."""
     dist = dist_cfg["name"]
     dist_dir = dists_path(base_dir, dist)
@@ -444,7 +446,7 @@ def build_release(base_dir: Path, dist_cfg: dict):
 # ---------------------------------------------
 # GPG signing
 
-def run_gpg(cmd: list):
+def run_gpg(cmd: list[str]) -> None:
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         die(
@@ -453,7 +455,7 @@ def run_gpg(cmd: list):
         )
 
 
-def _gpg_sign(release_path: Path, dest: Path, key_id: str, sign_flag: str):
+def _gpg_sign(release_path: Path, dest: Path, key_id: str, sign_flag: str) -> None:
     """Sign *release_path* with gpg, writing the signature atomically to *dest*.
 
     *sign_flag* selects the signature kind: "--detach-sign" for Release.gpg or
@@ -479,7 +481,7 @@ def _gpg_sign(release_path: Path, dest: Path, key_id: str, sign_flag: str):
     print(f"  [sign] {dest.name}")
 
 
-def sign_release(release_path: Path, key_id: str):
+def sign_release(release_path: Path, key_id: str) -> None:
     """Produce Release.gpg (detached) and InRelease (clearsigned)."""
     base = release_path.parent
     _gpg_sign(release_path, base / "Release.gpg", key_id, "--detach-sign")
@@ -489,7 +491,7 @@ def sign_release(release_path: Path, key_id: str):
 # ---------------------------------------------
 # Signature verification (Sequoia-PGP via the pysequoia bindings)
 
-def import_pysequoia():
+def import_pysequoia() -> tuple:
     """Import pysequoia lazily so commands that don't verify signatures
     (init, add, remove, update, list, prune) work without the dependency.
 
@@ -787,7 +789,7 @@ def _entry_sort_key(entry: bytes) -> tuple:
         return ("", "")
 
 
-def update_dist(cfg: dict, dist_name: str):
+def update_dist(cfg: dict, dist_name: str) -> None:
     """Regenerate Packages indices and Release file for one dist."""
     dist_cfg = cfg["dists"][dist_name]
     base_dir = cfg["base_dir"]
@@ -849,7 +851,7 @@ def build_repo_json(cfg: dict) -> dict:
     return {"dists": dists_out}
 
 
-def write_repo_metadata(cfg: dict):
+def write_repo_metadata(cfg: dict) -> None:
     """Write repo.json to the repo base directory.
 
     repo.json describes the dist/component/architecture structure of the repo
@@ -862,7 +864,7 @@ def write_repo_metadata(cfg: dict):
     print(f"  [meta] Written: repo.json")
 
 
-def regenerate(cfg: dict, dist_names):
+def regenerate(cfg: dict, dist_names: Iterable[str]) -> None:
     """Rebuild indices + Release for each unique dist, then write metadata once.
 
     This is the common tail of every command that mutates the repo (add,
@@ -987,7 +989,7 @@ def resolve_dists(cfg: dict, requested: list[str] | None) -> list[str]:
 # command: init
 # ---------------------------------------------------------------------------
 
-def cmd_init(cfg: dict):
+def cmd_init(cfg: dict) -> None:
     """Create the directory structure for all configured dists."""
     base_dir = cfg["base_dir"]
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -1034,7 +1036,7 @@ def cmd_init(cfg: dict):
 # ---------------------------------------------------------------------------
 
 def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
-            component: str | None = None):
+            component: str | None = None) -> None:
     """Add one or more .deb files to a dist."""
     dist_cfg = require_dist(cfg, dist_name)
     base_dir = cfg["base_dir"]
@@ -1077,7 +1079,7 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
 # ---------------------------------------------------------------------------
 
 def cmd_remove(cfg: dict, dist_name: str,
-               package: str, version: str, arch: str | None):
+               package: str, version: str, arch: str | None) -> None:
     """Remove a package version from the pool and regenerate indices."""
     dist_cfg = require_dist(cfg, dist_name)
     base_dir = cfg["base_dir"]
@@ -1108,7 +1110,7 @@ def cmd_remove(cfg: dict, dist_name: str,
 # command: update
 # ---------------------------------------------------------------------------
 
-def cmd_update(cfg: dict, dist_name: str | None):
+def cmd_update(cfg: dict, dist_name: str | None) -> None:
     """Regenerate indices for one or all dists."""
     dists = resolve_dists(cfg, [dist_name] if dist_name else None)
     regenerate(cfg, dists)
@@ -1118,7 +1120,7 @@ def cmd_update(cfg: dict, dist_name: str | None):
 # command: list
 # ---------------------------------------------------------------------------
 
-def cmd_list(cfg: dict, dist_name: str | None):
+def cmd_list(cfg: dict, dist_name: str | None) -> None:
     """List packages in one or all dists."""
     base_dir = cfg["base_dir"]
     dists = [dist_name] if dist_name else list(cfg["dists"])
@@ -1188,7 +1190,7 @@ def _authorise_signer(dist_name: str, dist_cfg: dict,
     return matched
 
 
-def _validate_changes_components(changes_info: dict, dist_cfg: dict):
+def _validate_changes_components(changes_info: dict, dist_cfg: dict) -> None:
     """Raise if any file's component is not configured for the target dist."""
     for entry in changes_info["files"]:
         comp = entry["component"]
@@ -1201,7 +1203,7 @@ def _validate_changes_components(changes_info: dict, dist_cfg: dict):
 
 
 def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
-                         changes_info: dict, verified_paths: list[Path]):
+                         changes_info: dict, verified_paths: list[Path]) -> None:
     """Add every verified .deb referenced by the .changes to the pool."""
     base_dir = cfg["base_dir"]
     for entry, deb_path in zip(changes_info["files"], verified_paths):
@@ -1217,7 +1219,7 @@ def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
 
 
 def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
-                         certs: list, dists_to_update: set[str]):
+                         certs: list, dists_to_update: set[str]) -> None:
     """Process a single .changes file. Raises on any error."""
 
     # Verify the signature FIRST, against the whole keyring, so that
@@ -1270,7 +1272,7 @@ def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
     print(f"  [OK] Moved to done/")
 
 
-def cmd_ingest(cfg: dict, incoming_dir: Path | None):
+def cmd_ingest(cfg: dict, incoming_dir: Path | None) -> None:
     """Process all signed .changes files in the incoming directory."""
 
     if incoming_dir is None:
@@ -1401,7 +1403,7 @@ def _prune_component(dist_name: str, component: str, base_dir: Path,
 
 def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
               components: list[str] | None, packages: list[str] | None,
-              dry_run: bool):
+              dry_run: bool) -> None:
     """Remove old package versions from the pool, keeping the <keep> newest.
 
     Versions are sorted using apt_pkg.version_compare so Debian version
@@ -1461,7 +1463,7 @@ def cmd_prune(cfg: dict, keep: int, dists: list[str] | None,
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Private APT repository manager", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument("-c", "--config", default="/etc/whawty/aptrepo.yml", help="Path to config file (default: /etc/whawty/aptrepo.yml)")
 
