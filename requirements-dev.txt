@@ -1,0 +1,5 @@
+# Development / CI tooling for static type checking.
+#   python -m pip install -r requirements-dev.txt
+#   python -m mypy aptrepo.py
+mypy==2.1.0
+types-PyYAML==6.0.12.20260518

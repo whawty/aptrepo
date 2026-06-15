@@ -1348,6 +1348,11 @@ def _group_pool_versions(base_dir: Path, dist_name: str, component: str,
     return groups
 
 
+def _version_cmp(a: tuple[str, Path], b: tuple[str, Path]) -> int:
+    """cmp() for (version, path) tuples using Debian version ordering."""
+    return apt_pkg.version_compare(a[0], b[0])
+
+
 def _select_versions_to_remove(versions: list[tuple[str, Path]], keep: int
                                ) -> tuple[list[tuple[str, Path]],
                                           list[tuple[str, Path]]]:
@@ -1359,9 +1364,7 @@ def _select_versions_to_remove(versions: list[tuple[str, Path]], keep: int
     """
     sorted_versions = sorted(
         versions,
-        key=functools.cmp_to_key(
-            lambda a, b: apt_pkg.version_compare(a[0], b[0])
-        ),
+        key=functools.cmp_to_key(_version_cmp),
         reverse=True,
     )
     return sorted_versions[:keep], sorted_versions[keep:]
