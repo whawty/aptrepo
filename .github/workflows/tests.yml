@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    # Run inside the actual target distribution images so the tests exercise
+    # the exact Python, python-apt and pysequoia versions shipped by each
+    # release, rather than pip-installed approximations.
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 13 trixie (Python 3.13)
+            image: debian:trixie
+          - name: Ubuntu 26.04 LTS (Python 3.14)
+            image: ubuntu:26.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install runtime dependencies
+        # python-apt and pysequoia come from the distribution, giving the same
+        # versions a real deployment on this release would use. dpkg-deb (from
+        # the base image) is used by the tests to build sample packages.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 python3-apt python3-yaml python3-pysequoia dpkg-dev
+
+      - name: Show versions
+        continue-on-error: true
+        run: |
+          python3 --version
+          python3 -c "import apt_pkg; print('python-apt:', apt_pkg.VERSION)"
+          python3 -c "import importlib.metadata as m; print('pysequoia:', m.version('pysequoia'))"
+
+      - name: Run test suite
+        run: python3 -m unittest discover -t . -s tests -v
