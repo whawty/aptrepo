@@ -65,5 +65,23 @@
  *     }
  *
  * Available variables: --bg --bg2 --bg3 --border --text --text-dim
- *                      --accent --accent-dim --danger --font --radius
+ *                      --accent --accent-dim --danger --shadow --font --radius
+ *
+ * THEMES
+ * ------
+ * The page ships a dark and a light palette and follows the browser's
+ * colour-scheme preference automatically.  A plain :root block as above
+ * applies to both themes.  To override only one of them, wrap the block in
+ * the matching media query:
+ *
+ *     @media (prefers-color-scheme: light) {
+ *       :root { --accent: #0969da; }
+ *     }
+ *     @media (prefers-color-scheme: dark) {
+ *       :root { --accent: #58a6ff; }
+ *     }
+ *
+ * To pin the page to a single theme regardless of the browser setting, set
+ * every colour variable in a plain :root block and add 'color-scheme: dark'
+ * (or light) so native widgets and scrollbars match.
  */

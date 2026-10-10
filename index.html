@@ -4,12 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>APT Repository</title>
-<link rel="stylesheet" href="custom.css" onerror="this.remove()">
 <style>
 /* ---------- reset & base ---------- */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
+  color-scheme: dark;
   --bg:        #0d1117;
   --bg2:       #161b22;
   --bg3:       #21262d;
@@ -19,8 +19,25 @@
   --accent:    #3fb950;
   --accent-dim:#1a4a24;
   --danger:    #f85149;
+  --shadow:    rgba(0,0,0,0.4);
   --font:      'JetBrains Mono', 'Fira Code', monospace;
   --radius:    4px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg:        #ffffff;
+    --bg2:       #f6f8fa;
+    --bg3:       #eaeef2;
+    --border:    #d0d7de;
+    --text:      #1f2328;
+    --text-dim:  #5e666e;
+    --accent:    #187733;
+    --accent-dim:#dafbe1;
+    --danger:    #cf222e;
+    --shadow:    rgba(31,35,40,0.16);
+  }
 }
 
 body {
@@ -130,7 +147,7 @@ header .subtitle {
   max-height: 260px;
   overflow-y: auto;
   z-index: 100;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  box-shadow: 0 8px 24px var(--shadow);
 }
 .ms-wrap.open .ms-panel { display: block; }
 .ms-option {
@@ -241,6 +258,7 @@ mark {
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
 </style>
+<link rel="stylesheet" href="custom.css" onerror="this.remove()">
 </head>
 <body>
 
