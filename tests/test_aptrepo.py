@@ -34,8 +34,13 @@ except Exception:
 
 
 def build_deb(dest_dir: Path, package: str, version: str,
-              arch: str = "amd64") -> Path:
-    """Build a minimal installable .deb with dpkg-deb and return its path."""
+              arch: str = "amd64", description: str | None = None) -> Path:
+    """Build a minimal installable .deb with dpkg-deb and return its path.
+
+    *description* can be varied to produce a byte-different package for the
+    same package/version/arch triple, which is exactly the case per-dist pools
+    (and per-dist incoming directories) exist to support.
+    """
     staging = dest_dir / f"{package}-{version}-{arch}-build"
     (staging / "DEBIAN").mkdir(parents=True)
     (staging / "DEBIAN" / "control").write_text(
@@ -43,7 +48,7 @@ def build_deb(dest_dir: Path, package: str, version: str,
         f"Version: {version}\n"
         f"Architecture: {arch}\n"
         f"Maintainer: Test <test@example.com>\n"
-        f"Description: Test package {package} {version}\n"
+        f"Description: {description or f'Test package {package} {version}'}\n"
     )
     out = dest_dir / f"{package}_{version}_{arch}.deb"
     subprocess.run(["dpkg-deb", "--build", str(staging), str(out)],
@@ -65,7 +70,14 @@ class AptRepoTestCase(unittest.TestCase):
         self.write_config()
 
     def write_config(self, signer_keyring: str | None = None,
-                     allowed_signers: list[str] | None = None):
+                     allowed_signers: list[str] | None = None,
+                     dists: dict[str, dict] | None = None):
+        """Write a test config.
+
+        *dists* maps dist name -> extra per-dist YAML keys (e.g. {"suite": …}).
+        """
+        if dists is None:
+            dists = {"bookworm": {}}
         lines = [
             "repo:",
             f"  base_dir: {self.base}",
@@ -82,12 +94,19 @@ class AptRepoTestCase(unittest.TestCase):
         if allowed_signers:
             quoted = ", ".join(f'"{s}"' for s in allowed_signers)
             lines.append(f"  allowed_signers: [{quoted}]")
-        lines += [
-            "dists:",
-            "  bookworm:",
-            "    description: Test dist",
-        ]
+        lines.append("dists:")
+        for name, extra in dists.items():
+            lines.append(f"  {name}:")
+            lines.append(f"    description: Test dist {name}")
+            for key, value in extra.items():
+                lines.append(f"    {key}: {value}")
         self.config.write_text("\n".join(lines) + "\n")
+
+    def incoming_for(self, dist: str) -> Path:
+        """Create and return the per-dist incoming directory."""
+        d = self.incoming / dist
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def aptrepo(self, *args, expect_success=True) -> subprocess.CompletedProcess:
         result = subprocess.run(
@@ -197,8 +216,9 @@ class AptRepoTestCase(unittest.TestCase):
                           allowed_signers=[cert.fingerprint])
         self.aptrepo("init")
 
-        deb = build_deb(self.incoming, "hello", "1.0")
-        (self.incoming / "hello_1.0_amd64.changes").write_bytes(
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
             self._sign_changes(deb, cert))
 
         self.aptrepo("ingest")
@@ -221,8 +241,9 @@ class AptRepoTestCase(unittest.TestCase):
 
         # ...but the .changes is signed by a different, untrusted key.
         attacker = Cert.generate("Attacker <evil@example.com>")
-        deb = build_deb(self.incoming, "hello", "1.0")
-        (self.incoming / "hello_1.0_amd64.changes").write_bytes(
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
             self._sign_changes(deb, attacker))
 
         self.aptrepo("ingest")  # should not crash, but must not accept the file
@@ -230,6 +251,109 @@ class AptRepoTestCase(unittest.TestCase):
             (self.base
              / "pool/bookworm/main/h/hello/hello_1.0_amd64.deb").exists(),
             "package from an unauthorised signer must not be ingested",
+        )
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_same_package_into_two_dists(self):
+        """The regression this layout exists for.
+
+        Two build servers upload a same-named package+version+arch for
+        different dists.  With a shared incoming directory the uploads would
+        collide; with per-dist directories both must survive and land in their
+        own pool, keeping their distinct contents.
+        """
+        from pysequoia import Cert
+        keyring = self.tmp / "signers"
+        keyring.mkdir()
+        cert = Cert.generate("Build Server <build@example.com>")
+        (keyring / "build.asc").write_text(str(cert))
+        self.write_config(signer_keyring=str(keyring),
+                          allowed_signers=[cert.fingerprint],
+                          dists={"bookworm": {}, "noble": {}})
+        self.aptrepo("init")
+
+        uploaded = {}
+        for dist in ("bookworm", "noble"):
+            inc = self.incoming_for(dist)
+            deb = build_deb(inc, "hello", "1.0",
+                            description=f"built for {dist}")
+            uploaded[dist] = deb.read_bytes()
+            (inc / "hello_1.0_amd64.changes").write_bytes(
+                self._sign_changes(deb, cert, dist=dist))
+
+        # Sanity: the two uploads really are different files.
+        self.assertNotEqual(uploaded["bookworm"], uploaded["noble"])
+
+        self.aptrepo("ingest")
+
+        for dist in ("bookworm", "noble"):
+            pooled = (self.base
+                      / f"pool/{dist}/main/h/hello/hello_1.0_amd64.deb")
+            self.assertTrue(pooled.is_file(),
+                            f"missing pooled package for {dist}")
+            self.assertEqual(pooled.read_bytes(), uploaded[dist],
+                             f"{dist} pool holds the wrong file")
+
+        # done/ is per-dist too, so the archived uploads cannot collide either.
+        for dist in ("bookworm", "noble"):
+            self.assertTrue(
+                (self.incoming / dist / "done" / "hello_1.0_amd64.deb").is_file()
+            )
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_rejects_wrong_incoming_directory(self):
+        """A .changes must declare the dist whose directory it was found in."""
+        from pysequoia import Cert
+        keyring = self.tmp / "signers"
+        keyring.mkdir()
+        cert = Cert.generate("Build Server <build@example.com>")
+        (keyring / "build.asc").write_text(str(cert))
+        self.write_config(signer_keyring=str(keyring),
+                          allowed_signers=[cert.fingerprint],
+                          dists={"bookworm": {}, "noble": {}})
+        self.aptrepo("init")
+
+        # Signed for noble, but uploaded into bookworm's incoming directory.
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes(deb, cert, dist="noble"))
+
+        self.aptrepo("ingest")
+
+        for dist in ("bookworm", "noble"):
+            self.assertFalse(
+                (self.base
+                 / f"pool/{dist}/main/h/hello/hello_1.0_amd64.deb").exists(),
+                f"misdirected upload must not be ingested into {dist}",
+            )
+        self.assertTrue(
+            (inc / "failed" / "hello_1.0_amd64.changes").is_file(),
+            "misdirected .changes should be moved to failed/",
+        )
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_accepts_suite_alias(self):
+        """Distribution: may name the dist's suite instead of the dist."""
+        from pysequoia import Cert
+        keyring = self.tmp / "signers"
+        keyring.mkdir()
+        cert = Cert.generate("Build Server <build@example.com>")
+        (keyring / "build.asc").write_text(str(cert))
+        self.write_config(signer_keyring=str(keyring),
+                          allowed_signers=[cert.fingerprint],
+                          dists={"bookworm": {"suite": "stable"}})
+        self.aptrepo("init")
+
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes(deb, cert, dist="stable"))
+
+        self.aptrepo("ingest")
+        self.assertTrue(
+            (self.base
+             / "pool/bookworm/main/h/hello/hello_1.0_amd64.deb").is_file()
         )
 
 

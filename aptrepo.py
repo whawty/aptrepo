@@ -19,6 +19,9 @@ Features:
     signatures
   - Signed .changes ingestion with signature verification via Sequoia-PGP
     (pysequoia), authorised per dist through an allowed_signers list
+  - Per-dist incoming directories (<incoming_dir>/<dist>/), so build servers
+    uploading the same package+version to different dists cannot clobber
+    each other
   - Pruning of old versions, keeping the newest N per package and architecture
     using Debian version ordering
   - Static, browsable HTML index that parses the Packages files in-browser
@@ -29,7 +32,7 @@ Usage:
   aptrepo.py remove           <dist> <package> <version> [<arch>]
   aptrepo.py update           [<dist>]
   aptrepo.py list             [<dist>]
-  aptrepo.py ingest           [<incoming_dir>]
+  aptrepo.py ingest           [-d <dist>]... [--incoming-dir <path>]
   aptrepo.py prune            <n> [-d <dist>]... [-C <component>]...
                               [-p <package>]... [--dry-run]
 """
@@ -197,6 +200,17 @@ def pool_path(base_dir: Path, dist: str, component: str,
     """Absolute path for a .deb inside the pool."""
     prefix = pool_prefix(source_name)
     return pool_dir(base_dir, dist, component) / prefix / source_name / filename
+
+
+def incoming_dir(incoming_base: Path, dist: str) -> Path:
+    """Directory where uploads for *dist* are dropped by the build servers.
+
+    Each dist gets its own incoming directory (with its own done/ and failed/
+    subdirectories) for the same reason it gets its own pool: the same
+    package/version/arch triple may legitimately be a different file per dist,
+    so a shared directory would let concurrent uploads clobber each other.
+    """
+    return incoming_base / dist
 
 
 def dists_path(base_dir: Path, dist: str) -> Path:
@@ -715,7 +729,7 @@ def parse_changes(payload: bytes) -> dict:
     }
 
 
-def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
+def verify_changes_files(changes_info: dict, dist_incoming: Path) -> list[Path]:
     """Check all .deb files referenced by a .changes exist and have correct checksums.
 
     Returns the list of verified .deb Paths.
@@ -726,7 +740,7 @@ def verify_changes_files(changes_info: dict, incoming_dir: Path) -> list[Path]:
 
     for entry in changes_info["files"]:
         fname = entry["filename"]
-        deb_path = incoming_dir / fname
+        deb_path = dist_incoming / fname
 
         if not deb_path.exists():
             errors.append(f"  Missing file: {fname}")
@@ -954,12 +968,12 @@ def load_config(path: Path) -> dict:
         for name, overrides in raw["dists"].items()
     }
 
-    incoming_dir = repo.get("incoming_dir")
+    incoming_base = repo.get("incoming_dir")
     signer_keyring = repo.get("signer_keyring")
 
     return {
         "base_dir": Path(repo["base_dir"]).expanduser(),
-        "incoming_dir": Path(incoming_dir).expanduser() if incoming_dir else None,
+        "incoming_dir": Path(incoming_base).expanduser() if incoming_base else None,
         "signer_keyring": Path(signer_keyring).expanduser() if signer_keyring else None,
         "dists": dists,
     }
@@ -1158,6 +1172,27 @@ def cmd_list(cfg: dict, dist_name: str | None) -> None:
 # command: ingest
 # ---------------------------------------------------------------------------
 
+def _check_declared_distribution(declared: str, dist_name: str, dist_cfg: dict) -> None:
+    """Raise unless the signed Distribution: field matches the incoming dist.
+
+    The directory an upload was placed in is *not* covered by the signature,
+    while the Distribution: field inside the .changes is.  Requiring the two to
+    agree means a file dropped into the wrong dist's incoming directory is
+    rejected rather than silently retargeted at another dist.
+
+    The dist's suite alias is accepted too (e.g. 'stable' for 'bookworm'),
+    since dput configurations commonly use suite names.
+    """
+    suite = dist_cfg.get("suite")
+    if declared == dist_name or (suite and declared == suite):
+        return
+    expected = f"'{dist_name}'" + (f" (or suite '{suite}')" if suite else "")
+    raise ValueError(
+        f"Distribution '{declared}' in .changes does not match the incoming "
+        f"directory for dist {expected}. The upload is in the wrong directory."
+    )
+
+
 def _authorise_signer(dist_name: str, dist_cfg: dict,
                       valid_fingerprints: list[str]) -> str:
     """Enforce the per-dist allow-list against already-verified signatures.
@@ -1218,9 +1253,14 @@ def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
         add_to_pool(base_dir, dist_name, entry["component"], meta, deb_path)
 
 
-def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
-                         certs: list, dists_to_update: set[str]) -> None:
-    """Process a single .changes file. Raises on any error."""
+def _process_one_changes(cfg: dict, dist_name: str, changes_path: Path,
+                         dist_incoming: Path, certs: list,
+                         dists_to_update: set[str]) -> None:
+    """Process a single .changes file. Raises on any error.
+
+    *dist_name* is the dist owning the incoming directory the file was found
+    in; the .changes must declare that same distribution.
+    """
 
     # Verify the signature FIRST, against the whole keyring, so that
     # everything parsed afterwards comes from cryptographically verified
@@ -1235,17 +1275,12 @@ def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
     except Exception as e:
         raise ValueError(f"Could not parse .changes file: {e}") from e
 
-    dist_name = changes_info["distribution"]
+    dist_cfg = cfg["dists"][dist_name]
     print(f"  Source:  {changes_info['source']}  {changes_info['version']}")
     print(f"  Dist:    {dist_name}")
 
-    # Check the target dist is known.
-    if dist_name not in cfg["dists"]:
-        raise ValueError(
-            f"Distribution '{dist_name}' is not configured in this repo. "
-            f"Known dists: {', '.join(cfg['dists'])}"
-        )
-    dist_cfg = cfg["dists"][dist_name]
+    # The signed Distribution: field must agree with the directory.
+    _check_declared_distribution(changes_info["distribution"], dist_name, dist_cfg)
 
     # Authorise: the (valid) signer must be allowed for THIS dist.
     matched = _authorise_signer(dist_name, dist_cfg, valid_fingerprints)
@@ -1259,32 +1294,69 @@ def _process_one_changes(cfg: dict, changes_path: Path, incoming_dir: Path,
     for entry in changes_info["files"]:
         print(f"    {entry['filename']}  [{entry['component']}/{entry['section']}]")
 
-    verified_paths = verify_changes_files(changes_info, incoming_dir)
+    verified_paths = verify_changes_files(changes_info, dist_incoming)
     _validate_changes_components(changes_info, dist_cfg)
 
     # Add each .deb to the pool, then move processed files to done/.
     _add_changes_to_pool(cfg, dist_name, dist_cfg, changes_info, verified_paths)
     dists_to_update.add(dist_name)
 
-    move_to(changes_path, incoming_dir / "done")
+    move_to(changes_path, dist_incoming / "done")
     for deb_path in verified_paths:
-        move_to(deb_path, incoming_dir / "done")
+        move_to(deb_path, dist_incoming / "done")
     print(f"  [OK] Moved to done/")
 
 
-def cmd_ingest(cfg: dict, incoming_dir: Path | None) -> None:
-    """Process all signed .changes files in the incoming directory."""
+def _ingest_dist(cfg: dict, dist_name: str, dist_incoming: Path,
+                 certs: list, dists_to_update: set[str]) -> int:
+    """Process every .changes file in one dist's incoming directory.
 
-    if incoming_dir is None:
-        incoming_dir = cfg.get("incoming_dir")
-    if incoming_dir is None:
+    Returns the number of .changes files found (successful or not).
+    """
+    changes_files = sorted(dist_incoming.glob("*.changes"))
+    if not changes_files:
+        return 0
+
+    print(f"\n=== {dist_name}: {len(changes_files)} .changes file(s) "
+          f"from {dist_incoming} ===")
+
+    failed_dir = dist_incoming / "failed"
+    (dist_incoming / "done").mkdir(exist_ok=True)
+    failed_dir.mkdir(exist_ok=True)
+
+    for changes_path in changes_files:
+        print(f"\n--- {changes_path.name} ---")
+        try:
+            _process_one_changes(cfg, dist_name, changes_path, dist_incoming,
+                                 certs, dists_to_update)
+        except Exception as e:
+            print(f"  [FAILED] {e}", file=sys.stderr)
+            # Move the .changes to failed/.  Referenced .deb files are left in
+            # place: a parse/verify failure means we cannot reliably attribute
+            # them, and they may be shared with another .changes.
+            move_to(changes_path, failed_dir)
+            continue
+
+    return len(changes_files)
+
+
+def cmd_ingest(cfg: dict, dists: list[str] | None,
+               incoming_base: Path | None) -> None:
+    """Process signed .changes files from each dist's incoming directory.
+
+    Uploads live in <incoming_base>/<dist>/, so that build servers targeting
+    different dists cannot overwrite each other's files.
+    """
+    if incoming_base is None:
+        incoming_base = cfg.get("incoming_dir")
+    if incoming_base is None:
         die(
-            "No incoming directory specified. Pass it as an argument or set "
+            "No incoming directory specified. Pass --incoming-dir or set "
             "'incoming_dir' under 'repo:' in the config."
         )
-    incoming_dir = Path(incoming_dir)
-    if not incoming_dir.exists():
-        die(f"Incoming directory does not exist: {incoming_dir}")
+    incoming_base = Path(incoming_base)
+    if not incoming_base.exists():
+        die(f"Incoming directory does not exist: {incoming_base}")
 
     # Signature verification needs the build servers' public certs.
     keyring = cfg.get("signer_keyring")
@@ -1297,31 +1369,20 @@ def cmd_ingest(cfg: dict, incoming_dir: Path | None) -> None:
     certs = load_signer_certs(keyring)
     print(f"Loaded {len(certs)} signer certificate(s) from {keyring}")
 
-    changes_files = sorted(incoming_dir.glob("*.changes"))
-    if not changes_files:
-        print(f"No .changes files found in {incoming_dir}")
-        return
-
-    print(f"Processing {len(changes_files)} .changes file(s) from {incoming_dir}")
-
-    done_dir = incoming_dir / "done"
-    failed_dir = incoming_dir / "failed"
-    done_dir.mkdir(exist_ok=True)
-    failed_dir.mkdir(exist_ok=True)
-
     dists_to_update: set[str] = set()
+    total = 0
 
-    for changes_path in changes_files:
-        print(f"\n--- {changes_path.name} ---")
-        try:
-            _process_one_changes(cfg, changes_path, incoming_dir, certs, dists_to_update)
-        except Exception as e:
-            print(f"  [FAILED] {e}", file=sys.stderr)
-            # Move the .changes to failed/.  Referenced .deb files are left in
-            # place: a parse/verify failure means we cannot reliably attribute
-            # them, and they may be shared with another .changes.
-            move_to(changes_path, failed_dir)
+    for dist_name in resolve_dists(cfg, dists):
+        dist_incoming = incoming_dir(incoming_base, dist_name)
+        if not dist_incoming.is_dir():
+            # A repo need not receive uploads for every dist.
             continue
+        total += _ingest_dist(cfg, dist_name, dist_incoming, certs,
+                              dists_to_update)
+
+    if total == 0:
+        print(f"No .changes files found under {incoming_base}")
+        return
 
     # Regenerate all affected dists once, after processing everything
     regenerate(cfg, dists_to_update)
@@ -1498,8 +1559,12 @@ def main() -> None:
     p_lst.add_argument("dist", nargs="?", default=None, help="Dist to list (default: all)")
 
     # ingest
-    p_ing = sub.add_parser("ingest", help="Ingest signed .changes files from the incoming directory")
-    p_ing.add_argument("incoming_dir", nargs="?", default=None, help="Incoming directory (overrides repo.incoming_dir from config)")
+    p_ing = sub.add_parser("ingest", help="Ingest signed .changes files from the per-dist incoming directories")
+    p_ing.add_argument("-d", "--dist", dest="dists", action="append", metavar="DIST",
+                       help="Limit to this dist (repeatable; default: all dists)")
+    p_ing.add_argument("--incoming-dir", dest="incoming_dir", default=None, metavar="PATH",
+                       help="Base incoming directory containing one subdirectory per dist "
+                            "(overrides repo.incoming_dir from config)")
 
     # prune
     p_prn = sub.add_parser("prune", help="Remove old package versions, keeping the N newest per package")
@@ -1529,7 +1594,7 @@ def main() -> None:
     elif args.command == "list":
         cmd_list(cfg, args.dist)
     elif args.command == "ingest":
-        cmd_ingest(cfg, args.incoming_dir)
+        cmd_ingest(cfg, args.dists, Path(args.incoming_dir) if args.incoming_dir else None)
     elif args.command == "prune":
         cmd_prune(cfg, args.keep, args.dists, args.components, args.packages, args.dry_run)
 
