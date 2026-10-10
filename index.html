@@ -142,6 +142,7 @@ header .subtitle {
   transition: background 0.1s;
 }
 .ms-option:hover { background: var(--bg3); }
+.ms-option.ms-all { border-bottom: 1px solid var(--border); }
 .ms-option input[type=checkbox] {
   accent-color: var(--accent);
   width: 13px; height: 13px;
@@ -399,35 +400,74 @@ function buildMultiSelect(wrapId, triggerId, panelId, items, placeholder, onChan
   const trigger = document.getElementById(triggerId);
   const panel   = document.getElementById(panelId);
 
-  panel.innerHTML = '';
-  const state = {};
-  items.forEach(item => {
-    state[item] = true;
-    const opt = document.createElement('div');
-    opt.className = 'ms-option';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.id   = `${panelId}-${item}`;
-    cb.checked = true;
-    const lbl = document.createElement('label');
-    lbl.htmlFor = cb.id;
-    lbl.textContent = item;
-    cb.addEventListener('change', () => {
-      state[item] = cb.checked;
-      updateTrigger();
-      onChange(state);
-    });
-    opt.append(cb, lbl);
-    panel.appendChild(opt);
-  });
+  let allSelected = true;   // "All" active: every item counts as selected
+  const state = {};         // individual picks, only meaningful while !allSelected
+  items.forEach(item => { state[item] = false; });
+
+  function selectedItems() {
+    return allSelected ? items.slice() : items.filter(item => state[item]);
+  }
 
   function updateTrigger() {
-    const selected = Object.keys(state).filter(k => state[k]);
-    trigger.textContent = selected.length === items.length
+    const selected = selectedItems();
+    trigger.textContent = allSelected
       ? placeholder
       : selected.length === 0
         ? `${placeholder}: none`
         : selected.join(', ');
+  }
+
+  function chooseAll() {
+    // "All" cannot be switched off directly -- that would leave nothing
+    // selected -- so clicking it while already active just redraws.
+    if (allSelected) { render(); return; }
+    allSelected = true;
+    items.forEach(item => { state[item] = false; });
+    render();
+    onChange();
+  }
+
+  function toggleItem(item, checked) {
+    if (allSelected) {
+      // The first individual pick replaces "All" with only that item.
+      allSelected = false;
+      items.forEach(i => { state[i] = false; });
+      state[item] = true;
+    } else {
+      state[item] = checked;
+      // Unchecking the last remaining pick falls back to "All" rather than
+      // leaving an empty selection with nothing to show.
+      if (!items.some(i => state[i])) allSelected = true;
+    }
+    render();
+    onChange();
+  }
+
+  // 'id' is namespaced by the caller so the "All" entry can never collide with
+  // an item that happens to be named "All".
+  function addOption(id, label, checked, onToggle, extraClass) {
+    const opt = document.createElement('div');
+    opt.className = extraClass ? `ms-option ${extraClass}` : 'ms-option';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.id = `${panelId}-${id}`;
+    cb.checked = checked;
+    const lbl = document.createElement('label');
+    lbl.htmlFor = cb.id;
+    lbl.textContent = label;
+    cb.addEventListener('change', () => onToggle(cb.checked));
+    opt.append(cb, lbl);
+    panel.appendChild(opt);
+  }
+
+  function render() {
+    panel.innerHTML = '';
+    addOption('all', 'All', allSelected, chooseAll, 'ms-all');
+    items.forEach(item => {
+      addOption(`item-${item}`, item, !allSelected && !!state[item],
+                checked => toggleItem(item, checked));
+    });
+    updateTrigger();
   }
 
   trigger.addEventListener('click', e => {
@@ -435,28 +475,16 @@ function buildMultiSelect(wrapId, triggerId, panelId, items, placeholder, onChan
     wrap.classList.toggle('open');
   });
 
+  render();
+
   return {
-    getSelected: () => Object.keys(state).filter(k => state[k]),
+    getSelected: selectedItems,
     setItems(newItems) {
       items = newItems;
-      newItems.forEach(item => { if (!(item in state)) state[item] = true; });
       Object.keys(state).forEach(k => { if (!newItems.includes(k)) delete state[k]; });
-      // re-render checkboxes
-      panel.innerHTML = '';
-      newItems.forEach(item => {
-        const opt = document.createElement('div');
-        opt.className = 'ms-option';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox'; cb.id = `${panelId}-${item}`; cb.checked = !!state[item];
-        const lbl = document.createElement('label');
-        lbl.htmlFor = cb.id; lbl.textContent = item;
-        cb.addEventListener('change', () => {
-          state[item] = cb.checked; updateTrigger(); onChange(state);
-        });
-        opt.append(cb, lbl);
-        panel.appendChild(opt);
-      });
-      updateTrigger();
+      newItems.forEach(item => { if (!(item in state)) state[item] = false; });
+      if (!allSelected && !newItems.some(item => state[item])) allSelected = true;
+      render();
     }
   };
 }
