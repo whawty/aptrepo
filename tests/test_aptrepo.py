@@ -281,6 +281,39 @@ class AptRepoTestCase(unittest.TestCase):
         self.assertIn("Package: other", packages)
 
     @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_moves_buildinfo_to_done(self):
+        cert = self._signed_setup()
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        buildinfo = inc / "hello_1.0_amd64.buildinfo"
+        buildinfo.write_text("Format: 1.0\nSource: hello\n")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([deb, buildinfo], cert))
+
+        self.aptrepo("ingest")
+        self.assertTrue((inc / "done" / "hello_1.0_amd64.buildinfo").is_file())
+        self.assertFalse(buildinfo.exists())
+        self.assertFalse(
+            (self.base / "pool/bookworm/main/h/hello/hello_1.0_amd64.buildinfo").exists(),
+            "non-.deb files must never be added to the pool")
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_leaves_tampered_buildinfo_in_incoming(self):
+        cert = self._signed_setup()
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        buildinfo = inc / "hello_1.0_amd64.buildinfo"
+        buildinfo.write_text("Format: 1.0\nSource: hello\n")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([deb, buildinfo], cert))
+        buildinfo.write_text("Format: 1.0\nSource: evil\n")
+
+        result = self.aptrepo("ingest")
+        self.assertIn("mismatch", result.stderr)
+        self.assertTrue(buildinfo.exists())
+        self.assertTrue((self.base / "pool/bookworm/main/h/hello/hello_1.0_amd64.deb").is_file())
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
     def test_ingest_accepts_authorised_signer(self):
         from pysequoia import Cert
         keyring = self.tmp / "signers"

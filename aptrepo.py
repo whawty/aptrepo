@@ -711,14 +711,22 @@ def parse_changes(payload: bytes) -> dict:
     all_filenames = set(files_map) | set(sha256_map)
 
     files: list[dict] = []
+    other_files: list[dict] = []
     for fname in sorted(all_filenames):
-        if not fname.endswith(".deb"):
-            # Skip .dsc, .tar.*, .buildinfo etc.
-            continue
         # Defence in depth: filenames from the .changes are used to locate
         # files on disk, so reject anything that is not a plain basename.
         if not is_safe_basename(fname):
             raise ValueError(f"Unsafe filename in .changes: {fname!r}")
+        if not fname.endswith(".deb"):
+            # .buildinfo, .ddeb, .dsc, .tar.* etc. are never added to the
+            # pool, but they are archived to done/ with the upload.
+            other_files.append({
+                "filename": fname,
+                "size":     files_map.get(fname, sha256_map.get(fname, {})).get("size"),
+                "sha256":   sha256_map.get(fname, {}).get("hash"),
+                "md5":      files_map.get(fname, {}).get("md5"),
+            })
+            continue
         raw_section = files_map.get(fname, {}).get("section", "")
         if "/" in raw_section:
             component, sec = raw_section.split("/", 1)
@@ -742,6 +750,7 @@ def parse_changes(payload: bytes) -> dict:
         "source":       source,
         "version":      version,
         "files":        files,
+        "other_files":  other_files,
     }
 
 
@@ -1282,6 +1291,35 @@ def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
         add_to_pool(base_dir, dist_name, component, meta, deb_path)
 
 
+def _matching_other_files(changes_info: dict, dist_incoming: Path) -> list[Path]:
+    """Return the non-.deb files of a .changes that should move to done/.
+
+    Only files that exist in the incoming directory and match the checksum in
+    the (verified) .changes are returned.  A missing file is fine (uploaders
+    need not send e.g. the .buildinfo); a mismatching one is left in place with
+    a warning, since it is not the file the .changes describes.
+    """
+    result: list[Path] = []
+    for entry in changes_info.get("other_files", []):
+        path = dist_incoming / entry["filename"]
+        if not path.is_file():
+            continue
+        if entry["size"] is not None and path.stat().st_size != entry["size"]:
+            warn(f"Size mismatch for {entry['filename']}; leaving it in incoming.")
+            continue
+        if entry.get("sha256"):
+            ok = file_sha256(path) == entry["sha256"]
+        elif entry.get("md5"):
+            ok = hashlib.md5(path.read_bytes()).hexdigest() == entry["md5"]
+        else:
+            ok = False
+        if not ok:
+            warn(f"Checksum mismatch for {entry['filename']}; leaving it in incoming.")
+            continue
+        result.append(path)
+    return result
+
+
 def _process_one_changes(cfg: dict, dist_name: str, changes_path: Path,
                          dist_incoming: Path, certs: list,
                          dists_to_update: set[str]) -> None:
@@ -1333,6 +1371,8 @@ def _process_one_changes(cfg: dict, dist_name: str, changes_path: Path,
     move_to(changes_path, dist_incoming / "done")
     for deb_path in verified_paths:
         move_to(deb_path, dist_incoming / "done")
+    for other_path in _matching_other_files(changes_info, dist_incoming):
+        move_to(other_path, dist_incoming / "done")
     print(f"  [OK] Moved to done/")
 
 
