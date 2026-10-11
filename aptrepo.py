@@ -279,25 +279,41 @@ def read_deb(deb_path: Path) -> dict:
 # ---------------------------------------------
 # Pool management
 
+def check_pool_collision(base_dir: Path, dist: str, component: str,
+                         meta: dict, src_path: Path) -> None:
+    """Raise ValueError if *src_path* would overwrite a different pool file.
+
+    An identical file already in the pool is not a collision (adding it again
+    is a no-op).  This is separate from add_to_pool() so that callers adding
+    several files at once can check all of them before copying any.
+    """
+    dest = pool_path(base_dir, dist, component,
+                     meta["source"], src_path.name)
+    if not dest.exists():
+        return
+    existing_sha256 = file_sha256(dest)
+    if existing_sha256 != meta["hashes"].get("SHA256"):
+        raise ValueError(
+            f"Pool collision: {dest.relative_to(base_dir)} exists with "
+            f"different content.\n"
+            f"  existing SHA256: {existing_sha256}\n"
+            f"  new      SHA256: {meta['hashes'].get('SHA256')}\n"
+            f"Bump the package version to resolve this."
+        )
+
+
 def add_to_pool(base_dir: Path, dist: str, component: str,
                 meta: dict, src_path: Path) -> Path:
-    """Copy .deb into the pool (if not already identical). Returns pool path."""
+    """Copy .deb into the pool (if not already identical). Returns pool path.
+
+    Raises ValueError on a pool collision (same filename, different content).
+    """
+    check_pool_collision(base_dir, dist, component, meta, src_path)
     dest = pool_path(base_dir, dist, component,
                      meta["source"], src_path.name)
     if dest.exists():
-        # Check if it's identical by SHA256
-        existing_sha256 = file_sha256(dest)
-        if existing_sha256 == meta["hashes"].get("SHA256"):
-            print(f"  [pool] Already present (identical): {dest.relative_to(base_dir)}")
-            return dest
-        else:
-            die(
-                f"Pool collision: {dest.relative_to(base_dir)} exists with "
-                f"different content.\n"
-                f"  existing SHA256: {existing_sha256}\n"
-                f"  new      SHA256: {meta['hashes'].get('SHA256')}\n"
-                f"Bump the package version to resolve this."
-            )
+        print(f"  [pool] Already present (identical): {dest.relative_to(base_dir)}")
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_path, dest)
     print(f"  [pool] Added: {dest.relative_to(base_dir)}")
@@ -1082,7 +1098,10 @@ def cmd_add(cfg: dict, dist_name: str, deb_paths: list[Path],
                 f"({', '.join(dist_cfg['architectures'])}). Adding anyway."
             )
 
-        add_to_pool(base_dir, dist_name, component, meta, deb_path)
+        try:
+            add_to_pool(base_dir, dist_name, component, meta, deb_path)
+        except ValueError as e:
+            die(str(e))
 
     # Regenerate indices for this dist
     regenerate(cfg, [dist_name])
@@ -1239,8 +1258,14 @@ def _validate_changes_components(changes_info: dict, dist_cfg: dict) -> None:
 
 def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
                          changes_info: dict, verified_paths: list[Path]) -> None:
-    """Add every verified .deb referenced by the .changes to the pool."""
+    """Add every verified .deb referenced by the .changes to the pool.
+
+    All files are checked for pool collisions before any is copied, so a
+    .changes is added completely or not at all.  Raises ValueError on a
+    collision.
+    """
     base_dir = cfg["base_dir"]
+    to_add: list[tuple[str, dict, Path]] = []
     for entry, deb_path in zip(changes_info["files"], verified_paths):
         meta = read_deb(deb_path)
 
@@ -1250,7 +1275,11 @@ def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
                 f"'{dist_name}'. Adding anyway."
             )
 
-        add_to_pool(base_dir, dist_name, entry["component"], meta, deb_path)
+        check_pool_collision(base_dir, dist_name, entry["component"], meta, deb_path)
+        to_add.append((entry["component"], meta, deb_path))
+
+    for component, meta, deb_path in to_add:
+        add_to_pool(base_dir, dist_name, component, meta, deb_path)
 
 
 def _process_one_changes(cfg: dict, dist_name: str, changes_path: Path,

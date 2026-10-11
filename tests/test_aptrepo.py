@@ -205,6 +205,81 @@ class AptRepoTestCase(unittest.TestCase):
         ).encode()
         return bytes(sign(cert.secrets.signer(), body, mode=SignatureMode.CLEAR))
 
+    def _sign_changes_files(self, files: list[Path], cert, dist="bookworm",
+                            source="hello", version="1.0") -> bytes:
+        """Like _sign_changes, but for any list of files (.deb or other)."""
+        from pysequoia import sign, SignatureMode
+        sha_lines, file_lines = [], []
+        for path in files:
+            data = path.read_bytes()
+            sha_lines.append(f" {hashlib.sha256(data).hexdigest()} {len(data)} {path.name}")
+            file_lines.append(f" {hashlib.md5(data).hexdigest()} {len(data)} admin optional {path.name}")
+        body = (
+            f"Format: 1.8\n"
+            f"Source: {source}\n"
+            f"Architecture: amd64\n"
+            f"Version: {version}\n"
+            f"Distribution: {dist}\n"
+            f"Maintainer: Test <test@example.com>\n"
+            f"Changes:\n {source} ({version}) {dist}; urgency=medium\n"
+            f"Checksums-Sha256:\n" + "\n".join(sha_lines) + "\n"
+            f"Files:\n" + "\n".join(file_lines) + "\n"
+        ).encode()
+        return bytes(sign(cert.secrets.signer(), body, mode=SignatureMode.CLEAR))
+
+    def _signed_setup(self, dists=None):
+        from pysequoia import Cert
+        keyring = self.tmp / "signers"
+        keyring.mkdir()
+        cert = Cert.generate("Build Server <build@example.com>")
+        (keyring / "build.asc").write_text(str(cert))
+        self.write_config(signer_keyring=str(keyring),
+                          allowed_signers=[cert.fingerprint], dists=dists)
+        self.aptrepo("init")
+        return cert
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_pool_collision_is_atomic_and_does_not_abort(self):
+        """A collision fails only its own .changes, adds none of its files,
+        and the rest of the run (other uploads, index regeneration) goes on."""
+        cert = self._signed_setup()
+        inc = self.incoming_for("bookworm")
+
+        # First upload: hello 1.0, ingested normally.
+        deb = build_deb(inc, "hello", "1.0", description="original")
+        original = deb.read_bytes()
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([deb], cert))
+        self.aptrepo("ingest")
+
+        # Second run: a different hello 1.0 (collision) together with a new
+        # hello-doc in the same .changes, plus an unrelated good upload.
+        build_dir = self.tmp / "second"
+        build_dir.mkdir()
+        bad = build_deb(build_dir, "hello", "1.0", description="rebuilt")
+        doc = build_deb(build_dir, "hello-doc", "1.0")
+        for p in (bad, doc):
+            shutil.copy(p, inc / p.name)
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([bad, doc], cert))
+        other = build_deb(inc, "other", "2.0")
+        (inc / "other_2.0_amd64.changes").write_bytes(
+            self._sign_changes_files([other], cert, source="other", version="2.0"))
+
+        result = self.aptrepo("ingest")
+        self.assertIn("Pool collision", result.stderr)
+
+        pool = self.base / "pool/bookworm/main"
+        self.assertFalse((pool / "h/hello/hello-doc_1.0_amd64.deb").exists(),
+                         "no file of a colliding .changes may be added")
+        self.assertEqual((pool / "h/hello/hello_1.0_amd64.deb").read_bytes(),
+                         original, "the pooled file must be left untouched")
+        self.assertTrue((inc / "failed" / "hello_1.0_amd64.changes").is_file())
+        self.assertTrue((pool / "o/other/other_2.0_amd64.deb").is_file(),
+                        "later uploads in the same run must still be ingested")
+        packages = (self.base / "dists/bookworm/main/binary-amd64/Packages").read_text()
+        self.assertIn("Package: other", packages)
+
     @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
     def test_ingest_accepts_authorised_signer(self):
         from pysequoia import Cert
