@@ -383,7 +383,9 @@ def build_packages_entry(meta: dict, filename_rel: str) -> bytes:
 
 def write_packages_index(entries: list[bytes], dest_dir: Path) -> None:
     """Write Packages, Packages.gz, Packages.xz to dest_dir."""
-    raw = b"\n".join(entries) + b"\n"
+    # An index without packages must be an empty file: apt rejects a file
+    # holding only a newline ("Encountered a section with no Package: header").
+    raw = b"\n".join(entries) + b"\n" if entries else b""
 
     buf_io = io.BytesIO()
     with gzip.GzipFile(fileobj=buf_io, mode="wb", mtime=0) as g:

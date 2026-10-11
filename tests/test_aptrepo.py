@@ -131,6 +131,19 @@ class AptRepoTestCase(unittest.TestCase):
             (self.base / "dists/bookworm/main/binary-amd64/Packages").is_file()
         )
 
+    def test_empty_component_index_is_empty(self):
+        """apt rejects a Packages file that holds only a newline, so an
+        empty component's index must stay a zero-byte file after updates."""
+        self.write_config(dists={"bookworm": {"components": "[main, extra]"}})
+        self.aptrepo("init")
+        deb = build_deb(self.pkgdir, "hello", "1.0")
+        self.aptrepo("add", "bookworm", str(deb))
+        empty = self.base / "dists/bookworm/extra/binary-amd64/Packages"
+        self.assertEqual(empty.read_bytes(), b"")
+        full = (self.base / "dists/bookworm/main/binary-amd64/Packages").read_bytes()
+        self.assertTrue(full.startswith(b"Package: hello\n"))
+        self.assertFalse(full.endswith(b"\n\n\n"))
+
     def test_add_and_list(self):
         self.aptrepo("init")
         deb = build_deb(self.pkgdir, "hello", "1.0")
