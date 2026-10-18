@@ -237,6 +237,39 @@ tr:hover td { background: var(--bg2); }
   opacity: 0.7;
 }
 
+/* ---------- download column ---------- */
+.col-dl { width: 1%; text-align: center; white-space: nowrap; }
+/* Not a sortable column, so it must not look clickable like the others. */
+th.col-dl { cursor: default; }
+th.col-dl:hover { color: var(--text-dim); }
+.dl-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px; height: 26px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  background: var(--bg3);
+  transition: color 0.15s, border-color 0.15s;
+}
+.dl-btn:hover, .dl-btn:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.dl-na { color: var(--text-dim); opacity: 0.6; }
+
+/* Visually hidden, but still read out by screen readers. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .empty-state {
   text-align: center;
   padding: 60px 20px;
@@ -299,6 +332,7 @@ mark {
         <th data-col="Description">Description <span class="sort-arrow">↕</span></th>
         <th data-col="_component">Component <span class="sort-arrow">↕</span></th>
         <th data-col="_dist">Dist <span class="sort-arrow">↕</span></th>
+        <th class="col-dl"><span class="sr-only">Download</span></th>
       </tr>
     </thead>
     <tbody id="pkg-body"></tbody>
@@ -360,6 +394,27 @@ function highlight(text, term) {
 }
 function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+// escHtml is enough for text between tags, but attribute values must also
+// escape quotes, otherwise a value containing one could end the attribute and
+// inject further markup.
+function escAttr(s) {
+  return escHtml(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ─── Download URL for a package ──────────────────────────────────────────────
+// The Packages index gives a Filename relative to the repository root, e.g.
+// pool/bookworm/main/h/hello/hello_1.0_amd64.deb.  Returns null when the field
+// is missing or is not a plain relative path, so such a row simply gets no
+// download link instead of a broken or surprising one.
+function debUrl(filename) {
+  if (!filename) return null;
+  const segments = filename.split('/');
+  if (segments.some(s => s === '' || s === '.' || s === '..')) return null;
+  // Encode each segment separately: the separators must survive, while
+  // characters that are legal in a filename but awkward in a URL (such as the
+  // ':' of an epoch version) must not.
+  return `${repoBase()}/${segments.map(encodeURIComponent).join('/')}`;
 }
 
 // ─── Debian version comparison (matches dpkg --compare-versions) ─────────────
@@ -644,6 +699,18 @@ function renderTable() {
 
   body.innerHTML = filtered.map(p => {
     const shortDesc = (p.Description || '').split('\n')[0];
+    const url = debUrl(p.Filename);
+    const debName = (p.Filename || '').split('/').pop();
+    const dl = url
+      ? `<a class="dl-btn" href="${escAttr(url)}" download="${escAttr(debName)}"
+            title="Download ${escAttr(debName)}" aria-label="Download ${escAttr(debName)}">
+           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+             <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+           </svg>
+         </a>`
+      : `<span class="dl-na" title="No file information in the Packages index">—</span>`;
     return `<tr>
       <td><span class="pkg-name">${highlight(p.Package || '', termRaw)}</span></td>
       <td><span class="pkg-ver">${escHtml(p.Version || '')}</span></td>
@@ -652,6 +719,7 @@ function renderTable() {
       <td><span class="pkg-desc">${highlight(shortDesc, termRaw)}</span></td>
       <td><span class="pkg-comp">${escHtml(p._component || '')}</span></td>
       <td><span class="pkg-comp">${escHtml(p._dist || '')}</span></td>
+      <td class="col-dl">${dl}</td>
     </tr>`;
   }).join('');
 
