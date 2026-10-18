@@ -33,6 +33,7 @@ Usage:
   aptrepo.py update           [<dist>]
   aptrepo.py list             [<dist>]
   aptrepo.py ingest           [-d <dist>]... [--incoming-dir <path>]
+                              [--dry-run] [--verbose]
   aptrepo.py prune            <n> [-d <dist>]... [-C <component>]...
                               [-p <package>]... [--dry-run]
 """
@@ -303,20 +304,24 @@ def check_pool_collision(base_dir: Path, dist: str, component: str,
 
 
 def add_to_pool(base_dir: Path, dist: str, component: str,
-                meta: dict, src_path: Path) -> Path:
+                meta: dict, src_path: Path, quiet: bool = False) -> Path:
     """Copy .deb into the pool (if not already identical). Returns pool path.
 
     Raises ValueError on a pool collision (same filename, different content).
+    With *quiet* nothing is printed, for callers that report per file
+    themselves.
     """
     check_pool_collision(base_dir, dist, component, meta, src_path)
     dest = pool_path(base_dir, dist, component,
                      meta["source"], src_path.name)
     if dest.exists():
-        print(f"  [pool] Already present (identical): {dest.relative_to(base_dir)}")
+        if not quiet:
+            print(f"  [pool] Already present (identical): {dest.relative_to(base_dir)}")
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_path, dest)
-    print(f"  [pool] Added: {dest.relative_to(base_dir)}")
+    if not quiet:
+        print(f"  [pool] Added: {dest.relative_to(base_dir)}")
     return dest
 
 
@@ -1267,30 +1272,84 @@ def _validate_changes_components(changes_info: dict, dist_cfg: dict) -> None:
             )
 
 
-def _add_changes_to_pool(cfg: dict, dist_name: str, dist_cfg: dict,
-                         changes_info: dict, verified_paths: list[Path]) -> None:
-    """Add every verified .deb referenced by the .changes to the pool.
+def _inspect_changes(cfg: dict, dist_name: str, changes_path: Path,
+                     dist_incoming: Path, certs: list) -> dict:
+    """Decide what an upload would do, without changing anything.
 
-    All files are checked for pool collisions before any is copied, so a
-    .changes is added completely or not at all.  Raises ValueError on a
-    collision.
+    Runs every check the ingest depends on -- signature verification, the
+    declared distribution, signer authorisation, file checksums, component
+    validation and pool-collision detection -- and returns a plan describing
+    the outcome.  Raises ValueError if the upload would be rejected.
+
+    This function is the whole of the decision; _apply_changes() only carries
+    the plan out.  A dry run therefore performs exactly the same checks as a
+    real ingest, and can only differ in whether the plan is executed.
     """
+    # Verify the signature FIRST, against the whole keyring, so that
+    # everything parsed afterwards comes from cryptographically verified
+    # bytes -- never from the raw file.
+    valid_fingerprints, payload = verify_changes_signature(changes_path, certs)
+
+    # Parse the *verified* payload.
+    try:
+        changes_info = parse_changes(payload)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not parse .changes file: {e}") from e
+
+    dist_cfg = cfg["dists"][dist_name]
+
+    # The signed Distribution: field must agree with the directory.
+    _check_declared_distribution(changes_info["distribution"], dist_name, dist_cfg)
+
+    # Authorise: the (valid) signer must be allowed for THIS dist.
+    signer = _authorise_signer(dist_name, dist_cfg, valid_fingerprints)
+
+    if not changes_info["files"]:
+        raise ValueError("No .deb files listed in .changes")
+
+    verified_paths = verify_changes_files(changes_info, dist_incoming)
+    _validate_changes_components(changes_info, dist_cfg)
+
     base_dir = cfg["base_dir"]
-    to_add: list[tuple[str, dict, Path]] = []
+    warnings: list[str] = []
+    files: list[dict] = []
     for entry, deb_path in zip(changes_info["files"], verified_paths):
         meta = read_deb(deb_path)
 
         if meta["arch"] not in dist_cfg["architectures"] and meta["arch"] != "all":
-            warn(
-                f"Architecture '{meta['arch']}' is not listed for dist "
-                f"'{dist_name}'. Adding anyway."
+            warnings.append(
+                f"architecture '{meta['arch']}' is not listed for dist "
+                f"'{dist_name}'; adding anyway"
             )
 
-        check_pool_collision(base_dir, dist_name, entry["component"], meta, deb_path)
-        to_add.append((entry["component"], meta, deb_path))
+        component = entry["component"]
+        # Check every file before any is copied, so a .changes is added
+        # completely or not at all.
+        check_pool_collision(base_dir, dist_name, component, meta, deb_path)
+        dest = pool_path(base_dir, dist_name, component,
+                         meta["source"], deb_path.name)
+        files.append({
+            "deb_path":  deb_path,
+            "meta":      meta,
+            "component": component,
+            "section":   entry["section"],
+            "pool_path": dest,
+            # A collision would have raised above, so an existing file here is
+            # byte-identical and copying it again would be a no-op.
+            "present":   dest.exists(),
+        })
 
-    for component, meta, deb_path in to_add:
-        add_to_pool(base_dir, dist_name, component, meta, deb_path)
+    return {
+        "changes_info":   changes_info,
+        "source":         changes_info["source"],
+        "version":        changes_info["version"],
+        "signer":         signer,
+        "files":          files,
+        "verified_paths": verified_paths,
+        "warnings":       warnings,
+    }
 
 
 def _matching_other_files(changes_info: dict, dist_incoming: Path) -> list[Path]:
@@ -1322,101 +1381,155 @@ def _matching_other_files(changes_info: dict, dist_incoming: Path) -> list[Path]
     return result
 
 
-def _process_one_changes(cfg: dict, dist_name: str, changes_path: Path,
-                         dist_incoming: Path, certs: list,
-                         dists_to_update: set[str]) -> None:
-    """Process a single .changes file. Raises on any error.
+def _apply_changes(cfg: dict, dist_name: str, changes_path: Path,
+                   dist_incoming: Path, plan: dict) -> None:
+    """Carry out an inspected upload: copy to the pool, then move to done/."""
+    base_dir = cfg["base_dir"]
+    for f in plan["files"]:
+        add_to_pool(base_dir, dist_name, f["component"], f["meta"],
+                    f["deb_path"], quiet=True)
 
-    *dist_name* is the dist owning the incoming directory the file was found
-    in; the .changes must declare that same distribution.
+    done_dir = dist_incoming / "done"
+    move_to(changes_path, done_dir)
+    for deb_path in plan["verified_paths"]:
+        move_to(deb_path, done_dir)
+    for other_path in _matching_other_files(plan["changes_info"], dist_incoming):
+        move_to(other_path, done_dir)
+
+
+# Upper bound for the .changes column: a single very long name overflows its
+# own row rather than widening the whole table.
+_REPORT_NAME_MAX = 42
+
+
+def _report_width(names: list[str]) -> int:
+    """Column width to align a group of report rows on."""
+    return min(max((len(n) for n in names), default=1), _REPORT_NAME_MAX)
+
+
+def _report(status: str, name: str, text: str, width: int,
+            err: bool = False) -> None:
+    """Print one aligned report row, continuing multi-line text underneath.
+
+    Rejections go to stderr (*err*), so that a scripted run can separate them
+    from the report while an interactive one still sees a single table.
     """
+    stream = sys.stderr if err else sys.stdout
+    lines = [ln.strip() for ln in text.strip().splitlines()] or ['']
+    print(f"  {status:<8} {name:<{width}}  {lines[0]}", file=stream)
+    for extra in lines[1:]:
+        print(f"  {'':8} {'':{width}}  {extra}", file=stream)
 
-    # Verify the signature FIRST, against the whole keyring, so that
-    # everything parsed afterwards comes from cryptographically verified
-    # bytes -- never from the raw file.
-    valid_fingerprints, payload = verify_changes_signature(changes_path, certs)
 
-    # Parse the *verified* payload.
-    try:
-        changes_info = parse_changes(payload)
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(f"Could not parse .changes file: {e}") from e
+def _plan_summary(plan: dict) -> str:
+    """One-line description of what an inspected upload contains."""
+    n = len(plan["files"])
+    present = sum(1 for f in plan["files"] if f["present"])
+    parts = [f"{plan['source']} {plan['version']}",
+             f"{n} file{'s' if n != 1 else ''}"]
+    if present:
+        parts.append(f"{n - present} new, {present} already in pool")
+    return ", ".join(parts)
 
-    dist_cfg = cfg["dists"][dist_name]
-    print(f"  Source:  {changes_info['source']}  {changes_info['version']}")
-    print(f"  Dist:    {dist_name}")
 
-    # The signed Distribution: field must agree with the directory.
-    _check_declared_distribution(changes_info["distribution"], dist_name, dist_cfg)
-
-    # Authorise: the (valid) signer must be allowed for THIS dist.
-    matched = _authorise_signer(dist_name, dist_cfg, valid_fingerprints)
-    print(f"  Signed by: {matched}")
-
-    # Check the file list, verify checksums, and validate components.
-    if not changes_info["files"]:
-        raise ValueError("No .deb files listed in .changes")
-
-    print(f"  Files ({len(changes_info['files'])}):")
-    for entry in changes_info["files"]:
-        print(f"    {entry['filename']}  [{entry['component']}/{entry['section']}]")
-
-    verified_paths = verify_changes_files(changes_info, dist_incoming)
-    _validate_changes_components(changes_info, dist_cfg)
-
-    # Add each .deb to the pool, then move processed files to done/.
-    _add_changes_to_pool(cfg, dist_name, dist_cfg, changes_info, verified_paths)
-    dists_to_update.add(dist_name)
-
-    move_to(changes_path, dist_incoming / "done")
-    for deb_path in verified_paths:
-        move_to(deb_path, dist_incoming / "done")
-    for other_path in _matching_other_files(changes_info, dist_incoming):
-        move_to(other_path, dist_incoming / "done")
-    print(f"  [OK] Moved to done/")
+def _print_plan_detail(plan: dict, width: int) -> None:
+    """Print the per-file breakdown of an upload (verbose mode)."""
+    indent = ' ' * (2 + 8 + 1 + width + 2)
+    print(f"{indent}signer {plan['signer']}")
+    for f in plan["files"]:
+        mark = '=' if f["present"] else '+'
+        print(f"{indent}{mark} {f['pool_path'].name}  "
+              f"[{f['component']}/{f['section']}, {f['meta']['arch']}]")
 
 
 def _ingest_dist(cfg: dict, dist_name: str, dist_incoming: Path,
-                 certs: list, dists_to_update: set[str]) -> int:
+                 certs: list, dists_to_update: set[str],
+                 dry_run: bool, verbose: bool) -> dict:
     """Process every .changes file in one dist's incoming directory.
 
-    Returns the number of .changes files found (successful or not).
+    Returns counts: found (.changes seen), accepted, files (package files
+    added) and unclaimed (files nothing referenced; dry run only).
     """
     changes_files = sorted(dist_incoming.glob("*.changes"))
-    if not changes_files:
-        return 0
 
-    print(f"\n=== {dist_name}: {len(changes_files)} .changes file(s) "
-          f"from {dist_incoming} ===")
+    # A dry run also reports files that nothing claims.  When a .changes fails
+    # its .deb files are deliberately left in place, so they pile up in the
+    # queue; listing them is often the only way to notice.  done/ and failed/
+    # are subdirectories and so not part of this.
+    unclaimed = ({p.name for p in dist_incoming.iterdir() if p.is_file()}
+                 if dry_run else set())
 
-    failed_dir = dist_incoming / "failed"
-    (dist_incoming / "done").mkdir(exist_ok=True)
-    failed_dir.mkdir(exist_ok=True)
+    if not changes_files and not unclaimed:
+        return {"found": 0, "accepted": 0, "files": 0, "unclaimed": 0}
+
+    print(f"\n{dist_name}: {len(changes_files)} .changes file(s) in {dist_incoming}")
+
+    if not dry_run:
+        (dist_incoming / "done").mkdir(exist_ok=True)
+        (dist_incoming / "failed").mkdir(exist_ok=True)
+
+    width = _report_width([p.name for p in changes_files])
+    accepted = 0
+    package_files = 0
+    referenced: set[str] = set()
 
     for changes_path in changes_files:
-        print(f"\n--- {changes_path.name} ---")
+        referenced.add(changes_path.name)
         try:
-            _process_one_changes(cfg, dist_name, changes_path, dist_incoming,
-                                 certs, dists_to_update)
+            plan = _inspect_changes(cfg, dist_name, changes_path,
+                                    dist_incoming, certs)
         except Exception as e:
-            print(f"  [FAILED] {e}", file=sys.stderr)
-            # Move the .changes to failed/.  Referenced .deb files are left in
-            # place: a parse/verify failure means we cannot reliably attribute
-            # them, and they may be shared with another .changes.
-            move_to(changes_path, failed_dir)
+            _report("FAILED", changes_path.name, str(e), width, err=True)
+            if not dry_run:
+                # Move the .changes to failed/.  Referenced .deb files are left
+                # in place: a parse/verify failure means we cannot reliably
+                # attribute them, and they may be shared with another .changes.
+                move_to(changes_path, dist_incoming / "failed")
             continue
 
-    return len(changes_files)
+        referenced.update(p.name for p in plan["verified_paths"])
+        referenced.update(e["filename"] for e in
+                          plan["changes_info"].get("other_files", []))
+
+        if not dry_run:
+            _apply_changes(cfg, dist_name, changes_path, dist_incoming, plan)
+            dists_to_update.add(dist_name)
+        else:
+            dists_to_update.add(dist_name)
+
+        accepted += 1
+        package_files += len(plan["files"])
+        _report("ok", changes_path.name, _plan_summary(plan), width)
+        for w in plan["warnings"]:
+            _report("", "", f"! {w}", width)
+        if verbose:
+            _print_plan_detail(plan, width)
+
+    leftovers: list[str] = []
+    if dry_run:
+        leftovers = sorted(unclaimed - referenced)
+        if leftovers:
+            print(f"  {'note':<8} {len(leftovers)} file(s) in this directory "
+                  f"not claimed by an accepted .changes")
+            if verbose:
+                for name in leftovers:
+                    print(f"  {'':8} {'':{width}}  - {name}")
+
+    return {"found": len(changes_files), "accepted": accepted,
+            "files": package_files, "unclaimed": len(leftovers)}
 
 
 def cmd_ingest(cfg: dict, dists: list[str] | None,
-               incoming_base: Path | None) -> None:
+               incoming_base: Path | None,
+               dry_run: bool = False, verbose: bool = False) -> None:
     """Process signed .changes files from each dist's incoming directory.
 
     Uploads live in <incoming_base>/<dist>/, so that build servers targeting
     different dists cannot overwrite each other's files.
+
+    With *dry_run* every check is still performed and the outcome reported,
+    but nothing is copied, moved or regenerated -- which is also the way to
+    see what is currently queued in the incoming directories.
     """
     if incoming_base is None:
         incoming_base = cfg.get("incoming_dir")
@@ -1438,21 +1551,43 @@ def cmd_ingest(cfg: dict, dists: list[str] | None,
             "allowed to sign uploads."
         )
     certs = load_signer_certs(keyring)
-    print(f"Loaded {len(certs)} signer certificate(s) from {keyring}")
+
+    mode = "[DRY RUN] " if dry_run else ""
+    print(f"{mode}Ingesting from {incoming_base} "
+          f"({len(certs)} signer certificate(s) from {keyring})")
 
     dists_to_update: set[str] = set()
-    total = 0
+    found = accepted = package_files = unclaimed = 0
 
     for dist_name in resolve_dists(cfg, dists):
         dist_incoming = incoming_dir(incoming_base, dist_name)
         if not dist_incoming.is_dir():
             # A repo need not receive uploads for every dist.
             continue
-        total += _ingest_dist(cfg, dist_name, dist_incoming, certs,
-                              dists_to_update)
+        counts = _ingest_dist(cfg, dist_name, dist_incoming, certs,
+                              dists_to_update, dry_run, verbose)
+        found += counts["found"]
+        accepted += counts["accepted"]
+        package_files += counts["files"]
+        unclaimed += counts["unclaimed"]
 
-    if total == 0:
-        print(f"No .changes files found under {incoming_base}")
+    if found == 0:
+        if unclaimed:
+            # Files are queued, but no .changes describes them.
+            print(f"\n{mode}No .changes files to process; {unclaimed} "
+                  f"unclaimed file(s) left in the incoming directories.")
+        else:
+            print(f"No .changes files found under {incoming_base}")
+        return
+
+    verb = "Would add" if dry_run else "Added"
+    print(f"\n{mode}{found} .changes file(s): {accepted} ok, "
+          f"{found - accepted} failed. "
+          f"{verb} {package_files} package file(s) "
+          f"to {len(dists_to_update)} dist(s).")
+
+    if dry_run:
+        print("          Re-run without --dry-run to apply.")
         return
 
     # Regenerate all affected dists once, after processing everything
@@ -1636,6 +1771,12 @@ def main() -> None:
     p_ing.add_argument("--incoming-dir", dest="incoming_dir", default=None, metavar="PATH",
                        help="Base incoming directory containing one subdirectory per dist "
                             "(overrides repo.incoming_dir from config)")
+    p_ing.add_argument("-n", "--dry-run", action="store_true",
+                       help="Run every check and report what would happen, without "
+                            "copying, moving or regenerating anything; use this to list "
+                            "what is queued in the incoming directories")
+    p_ing.add_argument("-v", "--verbose", action="store_true",
+                       help="Also print the signer and the individual files of each upload")
 
     # prune
     p_prn = sub.add_parser("prune", help="Remove old package versions, keeping the N newest per package")
@@ -1665,7 +1806,8 @@ def main() -> None:
     elif args.command == "list":
         cmd_list(cfg, args.dist)
     elif args.command == "ingest":
-        cmd_ingest(cfg, args.dists, Path(args.incoming_dir) if args.incoming_dir else None)
+        cmd_ingest(cfg, args.dists, Path(args.incoming_dir) if args.incoming_dir else None,
+                   args.dry_run, args.verbose)
     elif args.command == "prune":
         cmd_prune(cfg, args.keep, args.dists, args.components, args.packages, args.dry_run)
 

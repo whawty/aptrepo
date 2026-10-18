@@ -14,6 +14,7 @@ tool or library that is unavailable are skipped rather than failed.
 """
 
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -476,6 +477,172 @@ class AptRepoTestCase(unittest.TestCase):
             (self.base
              / "pool/bookworm/main/h/hello/hello_1.0_amd64.deb").is_file()
         )
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_rejects_tampered_signed_body(self):
+        """Editing the signed text after signing must invalidate the upload.
+
+        Everything downstream acts on the verified payload, so this is the
+        check the whole ingest rests on: a .changes whose body no longer
+        matches its signature must never be parsed, let alone pooled.
+        """
+        cert = self._signed_setup()
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        signed = self._sign_changes_files([deb], cert)
+
+        tampered = signed.replace(b"Maintainer: Test", b"Maintainer: Evil")
+        self.assertNotEqual(tampered, signed, "the fixture must really change the body")
+        (inc / "hello_1.0_amd64.changes").write_bytes(tampered)
+
+        self.aptrepo("ingest")
+        self.assertFalse(
+            (self.base / "pool/bookworm/main/h/hello/hello_1.0_amd64.deb").exists(),
+            "a .changes with a broken signature must not be ingested",
+        )
+        self.assertTrue((inc / "failed" / "hello_1.0_amd64.changes").is_file())
+
+    # -- ingest reporting and --dry-run ------------------------------------
+
+    @staticmethod
+    def _tree_state(root: Path) -> list[tuple[str, str]]:
+        """Every file below *root* with its hash, to detect any change."""
+        return sorted(
+            (str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest())
+            for p in root.rglob("*") if p.is_file()
+        )
+
+    @staticmethod
+    def _verdicts(result: subprocess.CompletedProcess) -> dict[str, str]:
+        """Map each reported .changes to its status from the ingest report.
+
+        Rejections are printed to stderr and accepted uploads to stdout, so
+        both streams are read.
+        """
+        verdicts = {}
+        for line in (result.stdout + result.stderr).splitlines():
+            m = re.match(r"\s{2}(ok|FAILED)\s+(\S+\.changes)\b", line)
+            if m:
+                verdicts[m.group(2)] = m.group(1)
+        return verdicts
+
+    def _mixed_queue(self, cert) -> Path:
+        """Queue one upload of each outcome: accepted, wrong dist, unsigned."""
+        inc = self.incoming_for("bookworm")
+
+        good = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([good], cert))
+
+        # Correctly signed, but declares a dist other than this directory's.
+        misdir = build_deb(inc, "misdir", "1.0")
+        (inc / "misdir_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([misdir], cert, dist="noble",
+                                     source="misdir"))
+
+        # Not an OpenPGP message at all: signature verification must reject it.
+        (inc / "junk_1.0_amd64.changes").write_bytes(b"not a signature\n")
+        return inc
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_dry_run_changes_nothing(self):
+        """--dry-run must not copy, move or regenerate anything."""
+        cert = self._signed_setup(dists={"bookworm": {}, "noble": {}})
+        inc = self._mixed_queue(cert)
+
+        before = self._tree_state(self.tmp)
+        result = self.aptrepo("ingest", "--dry-run")
+
+        self.assertEqual(self._tree_state(self.tmp), before,
+                         "a dry run must leave every file untouched")
+        self.assertFalse((inc / "done").exists(), "done/ must not be created")
+        self.assertFalse((inc / "failed").exists(), "failed/ must not be created")
+        self.assertEqual(list((self.base / "pool").rglob("*.deb")), [],
+                         "nothing may be added to the pool")
+        self.assertIn("[DRY RUN]", result.stdout)
+        self.assertIn("Re-run without --dry-run to apply.", result.stdout)
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_dry_run_matches_real_verdicts(self):
+        """The dry run must reach exactly the verdicts a real ingest reaches.
+
+        Both modes share _inspect_changes(), and this is what keeps them from
+        drifting apart: a dry run that accepted an upload the real ingest
+        rejects (or the reverse) would make it useless as a preview.
+        """
+        cert = self._signed_setup(dists={"bookworm": {}, "noble": {}})
+        self._mixed_queue(cert)
+
+        dry = self.aptrepo("ingest", "--dry-run")
+        real = self.aptrepo("ingest")
+
+        dry_verdicts = self._verdicts(dry)
+        self.assertEqual(dry_verdicts, self._verdicts(real))
+        # Guard the fixture itself: a scenario with only one outcome would
+        # make the comparison above vacuous.
+        self.assertEqual(
+            {"hello_1.0_amd64.changes": "ok",
+             "misdir_1.0_amd64.changes": "FAILED",
+             "junk_1.0_amd64.changes": "FAILED"},
+            dry_verdicts,
+        )
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_dry_run_reports_unclaimed_files(self):
+        """A .deb that no accepted .changes claims must be reported.
+
+        The .deb files of a failed upload are deliberately left in the queue,
+        so they accumulate; the dry run is what surfaces them.  This has to
+        work even when no .changes file is left to process at all.
+        """
+        cert = self._signed_setup()
+        inc = self.incoming_for("bookworm")
+        build_deb(inc, "orphan", "9.9")          # no .changes for it
+
+        result = self.aptrepo("ingest", "--dry-run")
+        self.assertIn("not claimed by an accepted .changes", result.stdout)
+        self.assertIn("unclaimed file(s) left", result.stdout)
+        self.assertNotIn("No .changes files found", result.stdout)
+
+        verbose = self.aptrepo("ingest", "--dry-run", "--verbose")
+        self.assertIn("orphan_9.9_amd64.deb", verbose.stdout)
+
+        # A real ingest reports the queue it processed, not the leftovers.
+        deb = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([deb], cert))
+        real = self.aptrepo("ingest")
+        self.assertNotIn("not claimed by an accepted .changes", real.stdout)
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_reports_one_line_per_changes(self):
+        """The report stays compact: one status row per .changes file."""
+        cert = self._signed_setup(dists={"bookworm": {}, "noble": {}})
+        self._mixed_queue(cert)
+
+        result = self.aptrepo("ingest")
+        rows = [ln for ln in (result.stdout + result.stderr).splitlines()
+                if re.match(r"\s{2}(ok|FAILED)\s", ln)]
+        self.assertEqual(len(rows), 3, f"expected one row per .changes: {rows}")
+        # Without --verbose the per-file breakdown must stay out of the report.
+        # (The header mentions the signer keyring, so match the detail line's
+        # shape rather than the bare word.)
+        self.assertNotIn("+ hello_1.0_amd64.deb", result.stdout)
+        self.assertNotRegex(result.stdout, r"signer [0-9A-F]{40}\b")
+
+    @unittest.skipUnless(HAVE_PYSEQUOIA, "pysequoia not available")
+    def test_ingest_verbose_adds_per_file_detail(self):
+        """--verbose names the signer and each file of an upload."""
+        cert = self._signed_setup()
+        inc = self.incoming_for("bookworm")
+        deb = build_deb(inc, "hello", "1.0")
+        (inc / "hello_1.0_amd64.changes").write_bytes(
+            self._sign_changes_files([deb], cert))
+
+        result = self.aptrepo("ingest", "--dry-run", "--verbose")
+        self.assertRegex(result.stdout, r"signer [0-9A-F]{40}\b")
+        self.assertIn("+ hello_1.0_amd64.deb", result.stdout)
+        self.assertIn("[main/admin, amd64]", result.stdout)
 
 
 if __name__ == "__main__":
