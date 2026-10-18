@@ -309,6 +309,10 @@ mark {
     <div class="ms-trigger" id="ms-comp-trigger">Components</div>
     <div class="ms-panel" id="ms-comp-panel"></div>
   </div>
+  <div class="ms-wrap" id="ms-arch">
+    <div class="ms-trigger" id="ms-arch-trigger">Architectures</div>
+    <div class="ms-panel" id="ms-arch-panel"></div>
+  </div>
   <div class="search-wrap">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
@@ -588,7 +592,7 @@ document.querySelectorAll('th[data-col]').forEach(th => {
 // ─── App state ────────────────────────────────────────────────────────────────
 let allPackages = [];   // all loaded pkg objects
 let repoMeta   = {};   // from repo.json
-let distCtrl, compCtrl;
+let distCtrl, compCtrl, archCtrl;
 let loadToken = 0;     // increments per load; stale responses are discarded
 
 function setStatus(msg, count) {
@@ -607,7 +611,7 @@ function setStatus(msg, count) {
 }
 
 // ─── Fetch + parse Packages files ────────────────────────────────────────────
-async function loadPackages(selectedDists, selectedComps) {
+async function loadPackages(selectedDists, selectedComps, selectedArchs) {
   const myToken = ++loadToken;
   setStatus('Loading…');
 
@@ -620,6 +624,7 @@ async function loadPackages(selectedDists, selectedComps) {
     for (const comp of selectedComps) {
       if (!distInfo.components.includes(comp)) continue;
       for (const arch of distInfo.architectures) {
+        if (!selectedArchs.includes(arch)) continue;
         const url = `${base}/dists/${dist}/${comp}/binary-${arch}/Packages`;
         fetches.push(
           fetch(url)
@@ -749,6 +754,7 @@ async function init() {
   repoMeta = meta;
   const distNames = Object.keys(meta.dists);
   const allComps  = [...new Set(distNames.flatMap(d => meta.dists[d].components))].sort();
+  const allArchs  = [...new Set(distNames.flatMap(d => meta.dists[d].architectures))].sort();
 
   document.getElementById('header-sub').textContent =
     `${distNames.length} dist${distNames.length !== 1 ? 's' : ''}`;
@@ -767,19 +773,31 @@ async function init() {
     () => onFilterChange()
   );
 
+  // Build architecture multi-select (union of all architectures across dists).
+  // These are the binary-<arch> index architectures; packages marked
+  // Architecture: all live in every one of them and so remain visible
+  // whichever architecture is selected -- which is correct, as they are
+  // installable on all of them.
+  archCtrl = buildMultiSelect(
+    'ms-arch', 'ms-arch-trigger', 'ms-arch-panel',
+    allArchs, 'Architectures',
+    () => onFilterChange()
+  );
+
   onFilterChange();
 }
 
 function onFilterChange() {
   const selDists = distCtrl.getSelected();
   const selComps = compCtrl.getSelected();
-  if (selDists.length === 0 || selComps.length === 0) {
+  const selArchs = archCtrl.getSelected();
+  if (selDists.length === 0 || selComps.length === 0 || selArchs.length === 0) {
     allPackages = [];
     renderTable();
     setStatus('Nothing selected.');
     return;
   }
-  loadPackages(selDists, selComps);
+  loadPackages(selDists, selComps, selArchs);
 }
 
 document.getElementById('search').addEventListener('input', renderTable);
