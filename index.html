@@ -167,6 +167,31 @@ header .subtitle {
 }
 .ms-option label { cursor: pointer; flex: 1; }
 
+/* ---------- reload button ---------- */
+.reload-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px; height: 30px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.reload-btn:hover:not(:disabled), .reload-btn:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.reload-btn:disabled { cursor: default; opacity: 0.6; }
+.reload-btn.spin svg { animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .reload-btn.spin svg { animation: none; }
+}
+
 /* ---------- status bar ---------- */
 #status {
   padding: 8px 28px;
@@ -319,6 +344,13 @@ mark {
     </svg>
     <input id="search" type="search" placeholder="Filter packages…" autocomplete="off" spellcheck="false">
   </div>
+  <button class="reload-btn" id="reload" type="button"
+          title="Reload from the repository" aria-label="Reload from the repository">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/>
+    </svg>
+  </button>
 </div>
 
 <div id="status">
@@ -353,6 +385,42 @@ mark {
 // e.g. https://repo.example.com/apt/ or http://apt.example.com/.
 function repoBase() {
   return new URL('.', document.baseURI).href.replace(/[/]$/, '');
+}
+
+// ─── Filter state in the URL ─────────────────────────────────────────────────
+// The current selection is mirrored into the query string so that reloading
+// the page (or sharing the link) comes back to the same view instead of
+// resetting to everything.
+function readFilterParams() {
+  const p = new URLSearchParams(location.search);
+  const list = name => (p.get(name) || '').split(',')
+                        .map(s => s.trim()).filter(Boolean);
+  return {
+    dists: list('dist'),
+    comps: list('comp'),
+    archs: list('arch'),
+    q:     p.get('q') || '',
+  };
+}
+
+function writeFilterParams() {
+  const p = new URLSearchParams();
+  // "All" is the default, so it is left out to keep the usual URL clean.
+  if (distCtrl && !distCtrl.isAll()) p.set('dist', distCtrl.getSelected().join(','));
+  if (compCtrl && !compCtrl.isAll()) p.set('comp', compCtrl.getSelected().join(','));
+  if (archCtrl && !archCtrl.isAll()) p.set('arch', archCtrl.getSelected().join(','));
+  const q = document.getElementById('search').value.trim();
+  if (q) p.set('q', q);
+
+  const qs = p.toString();
+  try {
+    // replaceState, not pushState: every checkbox click would otherwise add a
+    // history entry and make the back button useless.
+    history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
+  } catch (e) {
+    // Not worth breaking the page over (e.g. an unusual origin); the filters
+    // still work, they just will not survive a reload.
+  }
 }
 
 // ─── Packages file parser ─────────────────────────────────────────────────────
@@ -472,7 +540,8 @@ function debVerCompare(a, b) {
 }
 
 // ─── Multi-select dropdown ────────────────────────────────────────────────────
-function buildMultiSelect(wrapId, triggerId, panelId, items, placeholder, onChange) {
+function buildMultiSelect(wrapId, triggerId, panelId, items, placeholder, onChange,
+                         initialSelected) {
   const wrap    = document.getElementById(wrapId);
   const trigger = document.getElementById(triggerId);
   const panel   = document.getElementById(panelId);
@@ -480,6 +549,15 @@ function buildMultiSelect(wrapId, triggerId, panelId, items, placeholder, onChan
   let allSelected = true;   // "All" active: every item counts as selected
   const state = {};         // individual picks, only meaningful while !allSelected
   items.forEach(item => { state[item] = false; });
+
+  // A selection restored from the URL may name things this repository no
+  // longer has; those are ignored, and if nothing valid is left the selector
+  // simply starts on "All" rather than showing an empty view.
+  const restored = (initialSelected || []).filter(name => items.includes(name));
+  if (restored.length) {
+    allSelected = false;
+    restored.forEach(name => { state[name] = true; });
+  }
 
   function selectedItems() {
     return allSelected ? items.slice() : items.filter(item => state[item]);
@@ -556,6 +634,7 @@ function buildMultiSelect(wrapId, triggerId, panelId, items, placeholder, onChan
 
   return {
     getSelected: selectedItems,
+    isAll: () => allSelected,
     setItems(newItems) {
       items = newItems;
       Object.keys(state).forEach(k => { if (!newItems.includes(k)) delete state[k]; });
@@ -611,7 +690,8 @@ function setStatus(msg, count) {
 }
 
 // ─── Fetch + parse Packages files ────────────────────────────────────────────
-async function loadPackages(selectedDists, selectedComps, selectedArchs) {
+async function loadPackages(selectedDists, selectedComps, selectedArchs,
+                            fresh = false) {
   const myToken = ++loadToken;
   setStatus('Loading…');
 
@@ -627,7 +707,7 @@ async function loadPackages(selectedDists, selectedComps, selectedArchs) {
         if (!selectedArchs.includes(arch)) continue;
         const url = `${base}/dists/${dist}/${comp}/binary-${arch}/Packages`;
         fetches.push(
-          fetch(url)
+          fetch(url, fresh ? { cache: 'reload' } : undefined)
             .then(r => r.ok ? r.text() : Promise.reject(r.status))
             .then(text => {
               const pkgs = parsePackages(text);
@@ -737,40 +817,55 @@ function renderTable() {
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
-async function init() {
-  const base = repoBase();
-
-  let meta;
+async function fetchRepoMeta(fresh = false) {
   try {
-    const r = await fetch(`${base}/repo.json`);
+    const r = await fetch(`${repoBase()}/repo.json`,
+                          fresh ? { cache: 'reload' } : undefined);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    meta = await r.json();
+    return await r.json();
   } catch (e) {
     setStatus(`Failed to load repo.json: ${e.message}`);
+    return null;
+  }
+}
+
+function distUnion(meta, key) {
+  return [...new Set(Object.keys(meta.dists)
+            .flatMap(d => meta.dists[d][key]))].sort();
+}
+
+function setHeaderSub(distCount) {
+  document.getElementById('header-sub').textContent =
+    `${distCount} dist${distCount !== 1 ? 's' : ''}`;
+}
+
+async function init() {
+  const meta = await fetchRepoMeta();
+  if (!meta) {
     document.getElementById('header-sub').textContent = 'error loading repository metadata';
     return;
   }
 
   repoMeta = meta;
   const distNames = Object.keys(meta.dists);
-  const allComps  = [...new Set(distNames.flatMap(d => meta.dists[d].components))].sort();
-  const allArchs  = [...new Set(distNames.flatMap(d => meta.dists[d].architectures))].sort();
+  setHeaderSub(distNames.length);
 
-  document.getElementById('header-sub').textContent =
-    `${distNames.length} dist${distNames.length !== 1 ? 's' : ''}`;
+  // Restore whatever the URL asked for, so a reload keeps the current view.
+  const params = readFilterParams();
+  document.getElementById('search').value = params.q;
 
   // Build dist multi-select
   distCtrl = buildMultiSelect(
     'ms-dist', 'ms-dist-trigger', 'ms-dist-panel',
     distNames, 'Dists',
-    () => onFilterChange()
+    () => onFilterChange(), params.dists
   );
 
   // Build component multi-select (union of all components across dists)
   compCtrl = buildMultiSelect(
     'ms-comp', 'ms-comp-trigger', 'ms-comp-panel',
-    allComps, 'Components',
-    () => onFilterChange()
+    distUnion(meta, 'components'), 'Components',
+    () => onFilterChange(), params.comps
   );
 
   // Build architecture multi-select (union of all architectures across dists).
@@ -780,14 +875,50 @@ async function init() {
   // installable on all of them.
   archCtrl = buildMultiSelect(
     'ms-arch', 'ms-arch-trigger', 'ms-arch-panel',
-    allArchs, 'Architectures',
-    () => onFilterChange()
+    distUnion(meta, 'architectures'), 'Architectures',
+    () => onFilterChange(), params.archs
   );
 
+  // Drop anything the URL named that this repository does not have, so the
+  // address bar matches what is actually shown.
+  writeFilterParams();
   onFilterChange();
 }
 
-function onFilterChange() {
+// Re-read the repository without a page reload: repo.json may list new dists,
+// components or architectures, and the indices themselves may have changed.
+// The HTTP cache is bypassed, otherwise the button could appear to do nothing.
+async function reload() {
+  const btn = document.getElementById('reload');
+  btn.classList.add('spin');
+  btn.disabled = true;
+  try {
+    const meta = await fetchRepoMeta(true);
+    // Without repo.json the reload has failed; fetchRepoMeta has already put
+    // the reason on the status line, so stop here rather than carrying on and
+    // overwriting it with the result of a package load.  What is on screen
+    // stays, and the button can simply be pressed again.
+    if (!meta) return;
+
+    repoMeta = meta;
+    const distNames = Object.keys(meta.dists);
+    setHeaderSub(distNames.length);
+    // setItems keeps the current picks where they still exist and falls
+    // back to "All" for a selector whose choices have all disappeared.
+    distCtrl.setItems(distNames);
+    compCtrl.setItems(distUnion(meta, 'components'));
+    archCtrl.setItems(distUnion(meta, 'architectures'));
+    writeFilterParams();
+
+    await onFilterChange(true);
+  } finally {
+    btn.classList.remove('spin');
+    btn.disabled = false;
+  }
+}
+
+function onFilterChange(fresh = false) {
+  writeFilterParams();
   const selDists = distCtrl.getSelected();
   const selComps = compCtrl.getSelected();
   const selArchs = archCtrl.getSelected();
@@ -797,10 +928,14 @@ function onFilterChange() {
     setStatus('Nothing selected.');
     return;
   }
-  loadPackages(selDists, selComps, selArchs);
+  return loadPackages(selDists, selComps, selArchs, fresh);
 }
 
-document.getElementById('search').addEventListener('input', renderTable);
+document.getElementById('search').addEventListener('input', () => {
+  renderTable();
+  writeFilterParams();
+});
+document.getElementById('reload').addEventListener('click', reload);
 
 init();
 </script>
